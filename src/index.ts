@@ -10,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 type CommandResult = {
@@ -61,6 +61,12 @@ type RootfsBuildMeta = {
   builtAt: string;
 };
 
+type JailerLayout = {
+  vmDir: string;
+  rootDir: string;
+  apiSocketHostPath: string;
+};
+
 type VmState = VmConfig & {
   firecrackerPid: number;
   hostIface: string;
@@ -68,6 +74,9 @@ type VmState = VmConfig & {
   kernelPath: string;
   rootfsPath: string;
   sshKeyPath: string;
+  jailerVmDir: string;
+  firecrackerBinaryPath: string;
+  jailerBinaryPath: string;
   releaseTag: string;
   kernelCiVersion: string;
   kernelVersion: string;
@@ -88,6 +97,10 @@ const ARCH_ROOTFS_META = resolve(ARTIFACTS_DIR, "rootfs", "archlinux.ext4.meta.j
 const ROOTFS_TMP_DIR = resolve(WORK_DIR, "tmp");
 const ROOTFS_BUILD_FORMAT_VERSION = 2;
 const HOST_ALLOWED_TCP_PORT = "11434";
+const JAILER_BASE_DIR = resolve(WORK_DIR, "jailer");
+const JAILER_API_SOCKET_IN_JAIL = "/firecracker.socket";
+const JAILER_KERNEL_PATH_IN_JAIL = "/kernel/vmlinux";
+const JAILER_ROOTFS_PATH_IN_JAIL = "/rootfs.ext4";
 
 const DEFAULTS: VmConfig = {
   vmId: "vm0",
@@ -114,6 +127,7 @@ What "up" does:
   - resolves latest Firecracker release and CI kernel
   - downloads kernel artifact only when missing
   - builds/reuses Arch Linux rootfs.ext4 from Dockerfile.arch
+  - launches Firecracker through jailer (default, always)
   - configures tap + forwarding + iptables
   - boots a Firecracker microVM
   - waits for SSH and optionally attaches
@@ -155,10 +169,10 @@ const main = async (): Promise<void> => {
 
 const runUp = async (attach: boolean): Promise<void> => {
   ensureDirs([WORK_DIR, ARTIFACTS_DIR, RUNTIME_DIR]);
-  ensureDependencies(["firecracker", "curl", "ip", "iptables", "ssh", "ssh-keygen", "sudo", "docker", "mkfs.ext4", "tar"]);
+  ensureDependencies(["firecracker", "jailer", "curl", "ip", "iptables", "ssh", "ssh-keygen", "sudo", "docker", "mkfs.ext4", "tar"]);
   ensureKvmAccess();
-  ensureNoRunningVm();
   await ensureSudoSession();
+  ensureNoRunningVm();
 
   const arch = getHostArch();
   const kernel = await resolveLatestKernelArtifact(arch);
@@ -177,6 +191,24 @@ const runUp = async (attach: boolean): Promise<void> => {
   await downloadIfMissing(kernel.url, kernel.path);
   chmodSync(sshKeyPair.privateKeyPath, 0o600);
 
+  const firecrackerBinaryPath = resolveBinaryPath("firecracker");
+  const jailerBinaryPath = resolveBinaryPath("jailer");
+  const vmUid = String(getRuntimeUid());
+  const vmGid = String(getRuntimeGid());
+  const jailerLayout = prepareJailerLayout({
+    vmId: DEFAULTS.vmId,
+    firecrackerBinaryPath,
+    baseDir: JAILER_BASE_DIR,
+  });
+  stageJailerVmAssets({
+    jailerLayout,
+    kernelSourcePath: kernel.path,
+    rootfsSourcePath: rootfs.ext4Path,
+    runtimeUid: vmUid,
+    runtimeGid: vmGid,
+  });
+  stageJailerExecRuntimeDeps(firecrackerBinaryPath, jailerLayout.rootDir);
+
   const hostIface = getDefaultHostIface();
   let networkReady = false;
   let firecrackerPid = 0;
@@ -185,25 +217,37 @@ const runUp = async (attach: boolean): Promise<void> => {
     await setupHostNetwork(DEFAULTS, hostIface);
     networkReady = true;
 
-    firecrackerPid = launchFirecracker(DEFAULTS.apiSocketPath, DEFAULTS.logPath);
-    await waitForFirecrackerApi(DEFAULTS.apiSocketPath, 10_000);
+    firecrackerPid = launchJailedFirecracker({
+      vmId: DEFAULTS.vmId,
+      jailerBinaryPath,
+      firecrackerBinaryPath,
+      jailerBaseDir: JAILER_BASE_DIR,
+      runtimeUid: vmUid,
+      runtimeGid: vmGid,
+      logPath: DEFAULTS.logPath,
+    });
+    await waitForFirecrackerApi(jailerLayout.apiSocketHostPath, 10_000);
 
     const bootArgs = buildBootArgs(DEFAULTS, arch);
     await configureAndStartVm({
-      config: DEFAULTS,
-      kernelPath: kernel.path,
-      rootfsPath: rootfs.ext4Path,
+      config: { ...DEFAULTS, apiSocketPath: jailerLayout.apiSocketHostPath },
+      kernelPath: JAILER_KERNEL_PATH_IN_JAIL,
+      rootfsPath: JAILER_ROOTFS_PATH_IN_JAIL,
       bootArgs,
     });
 
     const state: VmState = {
       ...DEFAULTS,
+      apiSocketPath: jailerLayout.apiSocketHostPath,
       firecrackerPid,
       hostIface,
       bootArgs,
       kernelPath: kernel.path,
       rootfsPath: rootfs.ext4Path,
       sshKeyPath: sshKeyPair.privateKeyPath,
+      jailerVmDir: jailerLayout.vmDir,
+      firecrackerBinaryPath,
+      jailerBinaryPath,
       releaseTag: kernel.releaseTag,
       kernelCiVersion: kernel.ciVersion,
       kernelVersion: kernel.version,
@@ -230,6 +274,7 @@ const runUp = async (attach: boolean): Promise<void> => {
     if (networkReady) {
       await teardownHostNetwork(DEFAULTS, hostIface);
     }
+    cleanupJailerVmDir(jailerLayout.vmDir);
     safeDelete(STATE_FILE);
     throw error;
   }
@@ -252,10 +297,12 @@ const runDown = async (): Promise<void> => {
     logStep("No running VM state found.");
     return;
   }
+  await ensureSudoSession();
 
   stopProcess(state.firecrackerPid);
   safeDelete(state.apiSocketPath);
   await teardownHostNetwork(state, state.hostIface);
+  cleanupJailerVmDir(state.jailerVmDir);
   safeDelete(STATE_FILE);
   logStep("VM stopped and host network cleaned up.");
 };
@@ -593,6 +640,167 @@ const downloadIfMissing = async (url: string, path: string): Promise<void> => {
   renameSync(tempPath, path);
 };
 
+const resolveBinaryPath = (binary: string): string => {
+  const resolved = run(["bash", "-lc", `command -v ${binary}`]).stdout.trim();
+  if (!resolved) {
+    throw new Error(`Cannot resolve binary path for: ${binary}`);
+  }
+  return resolved;
+};
+
+const getRuntimeUid = (): number => {
+  const fromSudo = Number(process.env.SUDO_UID ?? "");
+  if (Number.isFinite(fromSudo) && fromSudo > 0) return fromSudo;
+  if (typeof process.getuid === "function") return process.getuid();
+  return 1000;
+};
+
+const getRuntimeGid = (): number => {
+  const fromSudo = Number(process.env.SUDO_GID ?? "");
+  if (Number.isFinite(fromSudo) && fromSudo > 0) return fromSudo;
+  if (typeof process.getgid === "function") return process.getgid();
+  return 1000;
+};
+
+const prepareJailerLayout = ({
+  vmId,
+  firecrackerBinaryPath,
+  baseDir,
+}: {
+  vmId: string;
+  firecrackerBinaryPath: string;
+  baseDir: string;
+}): JailerLayout => {
+  const execName = basename(firecrackerBinaryPath);
+  const vmDir = join(baseDir, execName, vmId);
+  const rootDir = join(vmDir, "root");
+  const apiSocketHostPath = join(rootDir, JAILER_API_SOCKET_IN_JAIL.slice(1));
+  return { vmDir, rootDir, apiSocketHostPath };
+};
+
+const stageJailerVmAssets = ({
+  jailerLayout,
+  kernelSourcePath,
+  rootfsSourcePath,
+  runtimeUid,
+  runtimeGid,
+}: {
+  jailerLayout: JailerLayout;
+  kernelSourcePath: string;
+  rootfsSourcePath: string;
+  runtimeUid: string;
+  runtimeGid: string;
+}): void => {
+  const kernelTargetPath = join(jailerLayout.rootDir, JAILER_KERNEL_PATH_IN_JAIL.slice(1));
+  const rootfsTargetPath = join(jailerLayout.rootDir, JAILER_ROOTFS_PATH_IN_JAIL.slice(1));
+
+  runRoot(["mkdir", "-p", dirname(kernelTargetPath)]);
+  runRoot(["mkdir", "-p", dirname(rootfsTargetPath)]);
+  runRoot(["rm", "-f", jailerLayout.apiSocketHostPath], { allowFailure: true });
+
+  stageFileIntoJail(kernelSourcePath, kernelTargetPath);
+  stageFileIntoJail(rootfsSourcePath, rootfsTargetPath);
+
+  runRoot(["chown", `${runtimeUid}:${runtimeGid}`, kernelTargetPath, rootfsTargetPath]);
+  runRoot(["chmod", "0644", kernelTargetPath, rootfsTargetPath]);
+};
+
+const stageJailerExecRuntimeDeps = (execPath: string, jailRootDir: string): void => {
+  const ldd = run(["ldd", execPath], { allowFailure: true });
+  if (ldd.exitCode !== 0) {
+    return;
+  }
+  if (ldd.stdout.includes("not a dynamic executable")) {
+    return;
+  }
+
+  const hostPaths = new Set<string>();
+  ldd.stdout
+    .split("\n")
+    .flatMap((line) => line.match(/\/[A-Za-z0-9._+\-/]+/g) ?? [])
+    .forEach((path) => {
+      if (existsSync(path)) {
+        hostPaths.add(path);
+      }
+    });
+
+  if (hostPaths.size === 0) {
+    return;
+  }
+
+  logStep(`staging ${hostPaths.size} runtime linker/library file(s) for jailed firecracker`);
+  [...hostPaths]
+    .sort()
+    .forEach((hostPath) => {
+      const jailedPath = join(jailRootDir, hostPath.slice(1));
+      runRoot(["mkdir", "-p", dirname(jailedPath)]);
+      runRoot(["cp", "-f", hostPath, jailedPath]);
+      runRoot(["chmod", "0755", jailedPath], { allowFailure: true });
+    });
+};
+
+const stageFileIntoJail = (sourcePath: string, targetPath: string): void => {
+  runRoot(["rm", "-f", targetPath], { allowFailure: true });
+  const linked = runRoot(["ln", sourcePath, targetPath], { allowFailure: true });
+  if (linked.exitCode === 0) return;
+  runRoot(["cp", "-f", sourcePath, targetPath]);
+};
+
+const launchJailedFirecracker = ({
+  vmId,
+  jailerBinaryPath,
+  firecrackerBinaryPath,
+  jailerBaseDir,
+  runtimeUid,
+  runtimeGid,
+  logPath,
+}: {
+  vmId: string;
+  jailerBinaryPath: string;
+  firecrackerBinaryPath: string;
+  jailerBaseDir: string;
+  runtimeUid: string;
+  runtimeGid: string;
+  logPath: string;
+}): number => {
+  mkdirSync(dirname(logPath), { recursive: true });
+
+  const jailerArgs = [
+    jailerBinaryPath,
+    "--id",
+    vmId,
+    "--exec-file",
+    firecrackerBinaryPath,
+    "--uid",
+    runtimeUid,
+    "--gid",
+    runtimeGid,
+    "--chroot-base-dir",
+    jailerBaseDir,
+    "--",
+    "--api-sock",
+    JAILER_API_SOCKET_IN_JAIL,
+  ];
+
+  const command = `nohup ${shellJoin(jailerArgs)} > ${shellQuote(logPath)} 2>&1 & echo $!`;
+  const result = runRoot(["bash", "-lc", command]);
+  const pid = Number(result.stdout.trim());
+  if (!Number.isFinite(pid) || pid <= 0) {
+    throw new Error(`Failed to launch jailer. Output: ${result.stdout}`);
+  }
+  return pid;
+};
+
+const cleanupJailerVmDir = (vmDir: string | undefined): void => {
+  if (!vmDir) return;
+  const resolved = resolve(vmDir);
+  const safeBase = resolve(JAILER_BASE_DIR);
+  if (!(resolved === safeBase || resolved.startsWith(`${safeBase}/`))) {
+    return;
+  }
+  runRoot(["rm", "-rf", resolved], { allowFailure: true });
+};
+
 const setupHostNetwork = async (config: VmConfig, hostIface: string): Promise<void> => {
   runRoot(["ip", "link", "del", config.tapDev], { allowFailure: true });
   runRoot(["ip", "tuntap", "add", "dev", config.tapDev, "mode", "tap", "user", targetUser()]);
@@ -777,19 +985,6 @@ const getDefaultHostIface = (): string => {
   return dev;
 };
 
-const launchFirecracker = (socketPath: string, logPath: string): number => {
-  safeDelete(socketPath);
-  mkdirSync(dirname(logPath), { recursive: true });
-
-  const command = `nohup firecracker --api-sock ${shellQuote(socketPath)} > ${shellQuote(logPath)} 2>&1 & echo $!`;
-  const result = run(["bash", "-lc", command]);
-  const pid = Number(result.stdout.trim());
-  if (!Number.isFinite(pid) || pid <= 0) {
-    throw new Error(`Failed to launch firecracker. Output: ${result.stdout}`);
-  }
-  return pid;
-};
-
 const waitForFirecrackerApi = async (socketPath: string, timeoutMs: number): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -929,6 +1124,7 @@ const ensureNoRunningVm = (): void => {
 
   safeDelete(STATE_FILE);
   safeDelete(state.apiSocketPath);
+  cleanupJailerVmDir(state.jailerVmDir);
 };
 
 const readState = (): VmState | null => {
@@ -954,6 +1150,8 @@ const isProcessAlive = (pid: number): boolean =>
 const targetUser = (): string => process.env.SUDO_USER ?? process.env.USER ?? "root";
 
 const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\"'\"'`)}'`;
+
+const shellJoin = (args: string[]): string => args.map(shellQuote).join(" ");
 
 const safeDelete = (path: string): void => {
   if (!existsSync(path)) return;
