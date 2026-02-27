@@ -74,35 +74,58 @@ type JailerProfile = {
   resourceLimits: string[];
 };
 
-type VmState = VmConfig & {
+type VmRuntimeState = {
   firecrackerPid: number;
   hostIface: string;
+  apiSocketPath: string;
   bootArgs: string;
   kernelPath: string;
-  rootfsPath: string;
-  sshKeyPath: string;
   jailerVmDir: string;
   firecrackerBinaryPath: string;
   jailerBinaryPath: string;
   releaseTag: string;
   kernelCiVersion: string;
   kernelVersion: string;
-  rootfsCiVersion: string;
-  rootfsUbuntuVersion: string;
+  startedAt: string;
+};
+
+type VmRecord = VmConfig & {
+  index: number;
+  rootfsPath: string;
+  sshKeyPath: string;
+  sshPublicKeyPath: string;
+  rootfsSource: string;
   rootfsBuildHash?: string;
   createdAt: string;
+  runtime?: VmRuntimeState;
+};
+
+type VmDatabase = {
+  formatVersion: number;
+  nextIndex: number;
+  vms: Record<string, VmRecord>;
+};
+
+type SshTarget = {
+  sshUser: string;
+  sshKeyPath: string;
+  guestIp: string;
 };
 
 const PROJECT_ROOT = process.cwd();
 const WORK_DIR = resolve(PROJECT_ROOT, ".microvm");
 const ARTIFACTS_DIR = join(WORK_DIR, "artifacts");
 const RUNTIME_DIR = join(WORK_DIR, "runtime");
-const STATE_FILE = join(RUNTIME_DIR, "state.json");
+const VMS_DIR = join(WORK_DIR, "vms");
+const VM_DB_FILE = join(RUNTIME_DIR, "vms.json");
 const ARCH_ROOTFS_DOCKERFILE = resolve(PROJECT_ROOT, "Dockerfile.arch");
 const ARCH_ROOTFS_EXT4 = resolve(ARTIFACTS_DIR, "rootfs", "archlinux.ext4");
 const ARCH_ROOTFS_META = resolve(ARTIFACTS_DIR, "rootfs", "archlinux.ext4.meta.json");
 const ROOTFS_TMP_DIR = resolve(WORK_DIR, "tmp");
 const ROOTFS_BUILD_FORMAT_VERSION = 2;
+const VM_DB_FORMAT_VERSION = 1;
+const DEFAULT_VM_ID = "vm0";
+const DEFAULT_VM_SSH_USER = "thierry";
 const HOST_ALLOWED_TCP_PORT = "11434";
 const JAILER_BASE_DIR = resolve(WORK_DIR, "jailer");
 const JAILER_API_SOCKET_IN_JAIL = "/firecracker.socket";
@@ -115,61 +138,79 @@ const DEFAULT_CGROUP_CPU_MAX = "200000 100000";
 const DEFAULT_CGROUP_PIDS_MAX = "512";
 const DEFAULT_RLIMIT_NOFILE = "1024";
 const DEFAULT_RLIMIT_FSIZE = "2147483648";
-
-const DEFAULTS: VmConfig = {
-  vmId: "vm0",
-  tapDev: "tap-vm0",
-  hostIp: "172.16.0.1",
-  guestIp: "172.16.0.2",
-  maskBits: "30",
-  maskLong: "255.255.255.252",
-  guestMac: "06:00:AC:10:00:02",
-  apiSocketPath: "/tmp/microvm-vm0.firecracker.sock",
-  logPath: join(RUNTIME_DIR, "firecracker.log"),
-  sshUser: "thierry",
-};
-const SSH_PRIVATE_KEY_PATH = resolve(ARTIFACTS_DIR, "keys", `${DEFAULTS.vmId}.id_ed25519`);
+const SHARED_SSH_PRIVATE_KEY_PATH = resolve(ARTIFACTS_DIR, "keys", "microvm.id_ed25519");
+const MAX_UNIX_SOCKET_PATH_LENGTH = 107;
 
 const HELP = `
 Usage:
-  bun src/index.ts up [--no-attach]
-  bun src/index.ts ssh
-  bun src/index.ts down
-  bun src/index.ts status
+  bun src/index.ts create [vm-id]
+  bun src/index.ts start [vm-id] [--no-attach]
+  bun src/index.ts stop [vm-id]
+  bun src/index.ts delete [vm-id]
+  bun src/index.ts ssh [vm-id]
+  bun src/index.ts status [vm-id]
+  bun src/index.ts list
+  bun src/index.ts up [vm-id] [--no-attach]   # alias for start
+  bun src/index.ts down [vm-id]                # alias for stop
 
-What "up" does:
-  - resolves latest Firecracker release and CI kernel
-  - downloads kernel artifact only when missing
-  - builds/reuses Arch Linux rootfs.ext4 from Dockerfile.arch
-  - launches Firecracker through jailer (default, always)
-  - configures tap + forwarding + iptables
-  - boots a Firecracker microVM
-  - waits for SSH and optionally attaches
+Notes:
+  - default vm-id is "${DEFAULT_VM_ID}" when omitted
+  - create builds/reuses base Arch rootfs and clones per-VM ext4
+  - each VM has isolated disk (.microvm/vms/<vm-id>/rootfs.ext4)
+  - VM registry persists in .microvm/runtime/vms.json
 `.trim();
 
 const decoder = new TextDecoder();
 
 const main = async (): Promise<void> => {
-  const command = process.argv[2] ?? "up";
-  const attach = !process.argv.includes("--no-attach");
+  const rawArgs = process.argv.slice(2);
+  const attach = !rawArgs.includes("--no-attach");
+  const positionalArgs = rawArgs.filter((arg) => arg !== "--no-attach");
+  const command = positionalArgs[0] ?? "up";
+  const vmId = normalizeVmId(positionalArgs[1]);
 
-  if (command === "up") {
-    await runUp(attach);
+  if (command === "create") {
+    await runCreate(vmId);
     return;
   }
 
-  if (command === "ssh") {
-    await runSsh();
+  if (command === "start") {
+    await runStart(vmId, attach, false);
+    return;
+  }
+
+  if (command === "up") {
+    await runStart(vmId, attach, true);
+    return;
+  }
+
+  if (command === "stop") {
+    await runStop(vmId);
+    return;
+  }
+
+  if (command === "delete") {
+    await runDelete(vmId);
     return;
   }
 
   if (command === "down") {
-    await runDown();
+    await runStop(vmId);
+    return;
+  }
+
+  if (command === "ssh") {
+    await runSsh(vmId);
     return;
   }
 
   if (command === "status") {
-    await runStatus();
+    await runStatus(positionalArgs[1]);
+    return;
+  }
+
+  if (command === "list") {
+    await runList();
     return;
   }
 
@@ -181,16 +222,20 @@ const main = async (): Promise<void> => {
   throw new Error(`Unknown command "${command}".\n\n${HELP}`);
 };
 
-const runUp = async (attach: boolean): Promise<void> => {
-  ensureDirs([WORK_DIR, ARTIFACTS_DIR, RUNTIME_DIR]);
-  ensureDependencies(["firecracker", "jailer", "curl", "ip", "iptables", "ssh", "ssh-keygen", "sudo", "docker", "mkfs.ext4", "tar"]);
-  ensureKvmAccess();
+const runCreate = async (vmId: string): Promise<void> => {
+  assertVmId(vmId);
+  assertJailerSafeVmId(vmId);
+  assertJailerSocketPathLength(vmId);
+  ensureDirs([WORK_DIR, ARTIFACTS_DIR, RUNTIME_DIR, VMS_DIR]);
+  ensureDependencies(["docker", "mkfs.ext4", "tar", "ssh-keygen", "sudo"]);
   await ensureSudoSession();
-  ensureNoRunningVm();
 
-  const arch = getHostArch();
-  const kernel = await resolveLatestKernelArtifact(arch);
-  const sshKeyPair = ensureSshKeyPair(SSH_PRIVATE_KEY_PATH);
+  const db = readVmDatabase();
+  if (db.vms[vmId]) {
+    throw new Error(`VM "${vmId}" already exists.`);
+  }
+
+  const sshKeyPair = ensureSshKeyPair(SHARED_SSH_PRIVATE_KEY_PATH);
   const rootfs = await ensureArchRootfsFromDocker({
     dockerfilePath: ARCH_ROOTFS_DOCKERFILE,
     ext4Path: ARCH_ROOTFS_EXT4,
@@ -198,27 +243,91 @@ const runUp = async (attach: boolean): Promise<void> => {
     sshPublicKeyPath: sshKeyPair.publicKeyPath,
   });
 
-  logStep(`latest Firecracker release: ${kernel.releaseTag}`);
-  logStep(`latest kernel: ${kernel.version} (${kernel.ciVersion})`);
-  logStep(`rootfs source: ${rootfs.source}`);
-
-  await downloadIfMissing(kernel.url, kernel.path);
+  const index = reserveVmIndex(db);
+  const config = buildVmConfig(vmId, index);
+  const vmRootfsPath = join(vmDataDir(vmId), "rootfs.ext4");
+  cloneExt4Rootfs(rootfs.ext4Path, vmRootfsPath);
   chmodSync(sshKeyPair.privateKeyPath, 0o600);
 
+  const record: VmRecord = {
+    ...config,
+    index,
+    rootfsPath: vmRootfsPath,
+    sshKeyPath: sshKeyPair.privateKeyPath,
+    sshPublicKeyPath: sshKeyPair.publicKeyPath,
+    rootfsSource: rootfs.source,
+    rootfsBuildHash: rootfs.buildHash,
+    createdAt: new Date().toISOString(),
+  };
+  db.vms[vmId] = record;
+  writeVmDatabase(db);
+  logStep(`created VM "${vmId}" with isolated disk: ${vmRootfsPath}`);
+};
+
+const runStart = async (vmId: string, attach: boolean, autoCreate: boolean): Promise<void> => {
+  assertVmId(vmId);
+  assertJailerSafeVmId(vmId);
+  ensureDirs([WORK_DIR, ARTIFACTS_DIR, RUNTIME_DIR, VMS_DIR]);
+  ensureDependencies(["firecracker", "jailer", "curl", "ip", "iptables", "ssh", "ssh-keygen", "sudo", "docker", "mkfs.ext4", "tar"]);
+  ensureKvmAccess();
+  await ensureSudoSession();
+
+  let db = readVmDatabase();
+  let vm = db.vms[vmId];
+  if (!vm) {
+    if (!autoCreate) {
+      throw new Error(`VM "${vmId}" does not exist. Run "bun src/index.ts create ${vmId}" first.`);
+    }
+    logStep(`VM "${vmId}" not found, creating it now...`);
+    await runCreate(vmId);
+    db = readVmDatabase();
+    vm = db.vms[vmId];
+  }
+  if (!vm) {
+    throw new Error(`Failed to load VM "${vmId}" after creation.`);
+  }
+  if (!existsSync(vm.rootfsPath)) {
+    throw new Error(`VM rootfs is missing: ${vm.rootfsPath}`);
+  }
+
+  if (vm.runtime && isProcessAlive(vm.runtime.firecrackerPid)) {
+    throw new Error(`VM "${vmId}" is already running (pid ${vm.runtime.firecrackerPid}).`);
+  }
+  if (vm.runtime && !isProcessAlive(vm.runtime.firecrackerPid)) {
+    logStep(`found stale runtime state for "${vmId}", cleaning it up...`);
+    await cleanupVmRuntime(vm);
+    clearVmRuntime(vmId);
+    db = readVmDatabase();
+    vm = db.vms[vmId];
+    if (!vm) {
+      throw new Error(`VM "${vmId}" disappeared from database.`);
+    }
+  }
+
+  const arch = getHostArch();
+  const kernel = await resolveLatestKernelArtifact(arch);
+  logStep(`latest Firecracker release: ${kernel.releaseTag}`);
+  logStep(`latest kernel: ${kernel.version} (${kernel.ciVersion})`);
+  logStep(`rootfs source: ${vm.rootfsSource}`);
+
+  await downloadIfMissing(kernel.url, kernel.path);
+  chmodSync(vm.sshKeyPath, 0o600);
+
   const firecrackerBinaryPath = resolveBinaryPath("firecracker");
+  assertJailerSocketPathLength(vmId, basename(firecrackerBinaryPath));
   const jailerBinaryPath = resolveBinaryPath("jailer");
   const jailerProfile = resolveJailerProfile();
   const vmUid = String(getRuntimeUid());
   const vmGid = String(getRuntimeGid());
   const jailerLayout = prepareJailerLayout({
-    vmId: DEFAULTS.vmId,
+    vmId: vm.vmId,
     firecrackerBinaryPath,
     baseDir: JAILER_BASE_DIR,
   });
   stageJailerVmAssets({
     jailerLayout,
     kernelSourcePath: kernel.path,
-    rootfsSourcePath: rootfs.ext4Path,
+    rootfsSourcePath: vm.rootfsPath,
     runtimeUid: vmUid,
     runtimeGid: vmGid,
   });
@@ -229,56 +338,57 @@ const runUp = async (attach: boolean): Promise<void> => {
   let firecrackerPid = 0;
 
   try {
-    await setupHostNetwork(DEFAULTS, hostIface);
+    await setupHostNetwork(vm, hostIface);
     networkReady = true;
 
     firecrackerPid = launchJailedFirecracker({
-      vmId: DEFAULTS.vmId,
+      vmId: vm.vmId,
       jailerBinaryPath,
       firecrackerBinaryPath,
       jailerBaseDir: JAILER_BASE_DIR,
       runtimeUid: vmUid,
       runtimeGid: vmGid,
       jailerProfile,
-      logPath: DEFAULTS.logPath,
+      logPath: vm.logPath,
     });
     await waitForFirecrackerApi(jailerLayout.apiSocketHostPath, 10_000);
 
-    const bootArgs = buildBootArgs(DEFAULTS, arch);
+    const bootArgs = buildBootArgs(vm, arch);
     await configureAndStartVm({
-      config: { ...DEFAULTS, apiSocketPath: jailerLayout.apiSocketHostPath },
+      config: { ...vm, apiSocketPath: jailerLayout.apiSocketHostPath },
       kernelPath: JAILER_KERNEL_PATH_IN_JAIL,
       rootfsPath: JAILER_ROOTFS_PATH_IN_JAIL,
       bootArgs,
     });
 
-    const state: VmState = {
-      ...DEFAULTS,
-      apiSocketPath: jailerLayout.apiSocketHostPath,
+    const runtime: VmRuntimeState = {
       firecrackerPid,
       hostIface,
+      apiSocketPath: jailerLayout.apiSocketHostPath,
       bootArgs,
       kernelPath: kernel.path,
-      rootfsPath: rootfs.ext4Path,
-      sshKeyPath: sshKeyPair.privateKeyPath,
       jailerVmDir: jailerLayout.vmDir,
       firecrackerBinaryPath,
       jailerBinaryPath,
       releaseTag: kernel.releaseTag,
       kernelCiVersion: kernel.ciVersion,
       kernelVersion: kernel.version,
-      rootfsCiVersion: "local-docker",
-      rootfsUbuntuVersion: rootfs.source,
-      rootfsBuildHash: rootfs.buildHash,
-      createdAt: new Date().toISOString(),
+      startedAt: new Date().toISOString(),
     };
-    writeJson(STATE_FILE, state);
+    db = readVmDatabase();
+    const persistedVm = db.vms[vmId];
+    if (!persistedVm) {
+      throw new Error(`VM "${vmId}" not found while persisting runtime state.`);
+    }
+    db.vms[vmId] = { ...persistedVm, runtime };
+    writeVmDatabase(db);
 
-    await waitForSshReady(state, 120_000);
-    logStep(`VM is ready. SSH command: ${renderSshCommand(state)}`);
+    const sshTarget = toSshTarget(db.vms[vmId]);
+    await waitForSshReady(sshTarget, 120_000);
+    logStep(`VM "${vmId}" is ready. SSH command: ${renderSshCommand(sshTarget)}`);
 
     if (attach) {
-      const sshExitCode = spawnInherit(sshBaseArgs(state));
+      const sshExitCode = spawnInherit(sshBaseArgs(sshTarget));
       if (sshExitCode !== 0) {
         logStep(`ssh session ended with exit code ${sshExitCode}`);
       }
@@ -288,50 +398,95 @@ const runUp = async (attach: boolean): Promise<void> => {
       stopProcess(firecrackerPid);
     }
     if (networkReady) {
-      await teardownHostNetwork(DEFAULTS, hostIface);
+      await teardownHostNetwork(vm, hostIface);
     }
     cleanupJailerVmDir(jailerLayout.vmDir);
-    safeDelete(STATE_FILE);
+    clearVmRuntime(vmId);
     throw error;
   }
 };
 
-const runSsh = async (): Promise<void> => {
-  const state = readState();
-  if (!state) {
-    throw new Error(`No VM state found at ${STATE_FILE}. Run "up" first.`);
+const runSsh = async (vmId: string): Promise<void> => {
+  assertVmId(vmId);
+  const vm = getVmOrThrow(vmId);
+  if (!vm.runtime || !isProcessAlive(vm.runtime.firecrackerPid)) {
+    throw new Error(`VM "${vmId}" is not running.`);
   }
-  const sshExitCode = spawnInherit(sshBaseArgs(state));
+
+  const sshExitCode = spawnInherit(sshBaseArgs(toSshTarget(vm)));
   if (sshExitCode !== 0) {
     logStep(`ssh session ended with exit code ${sshExitCode}`);
   }
 };
 
-const runDown = async (): Promise<void> => {
-  const state = readState();
-  if (!state) {
-    logStep("No running VM state found.");
+const runStop = async (vmId: string): Promise<void> => {
+  assertVmId(vmId);
+  const vm = getVmOrThrow(vmId);
+  if (!vm.runtime) {
+    logStep(`VM "${vmId}" is already stopped.`);
     return;
   }
   await ensureSudoSession();
-
-  stopProcess(state.firecrackerPid);
-  safeDelete(state.apiSocketPath);
-  await teardownHostNetwork(state, state.hostIface);
-  cleanupJailerVmDir(state.jailerVmDir);
-  safeDelete(STATE_FILE);
-  logStep("VM stopped and host network cleaned up.");
+  await cleanupVmRuntime(vm);
+  clearVmRuntime(vmId);
+  logStep(`VM "${vmId}" stopped and host network cleaned up.`);
 };
 
-const runStatus = async (): Promise<void> => {
-  const state = readState();
-  if (!state) {
-    logStep("No state file found.");
+const runDelete = async (vmId: string): Promise<void> => {
+  assertVmId(vmId);
+  const db = readVmDatabase();
+  const vm = db.vms[vmId];
+  if (!vm) {
+    logStep(`VM "${vmId}" does not exist.`);
     return;
   }
 
-  const alive = isProcessAlive(state.firecrackerPid);
-  console.log(JSON.stringify({ state, firecrackerAlive: alive }, null, 2));
+  await ensureSudoSession();
+
+  if (vm.runtime) {
+    await cleanupVmRuntime(vm);
+  }
+
+  safeDelete(vm.apiSocketPath);
+  safeDeleteInsideWorkDir(vmDataDir(vmId));
+  safeDeleteInsideWorkDir(join(RUNTIME_DIR, vmId));
+  cleanupJailerVmDir(vm.runtime?.jailerVmDir ?? join(JAILER_BASE_DIR, "firecracker", vmId));
+
+  delete db.vms[vmId];
+  writeVmDatabase(db);
+
+  logStep(`VM "${vmId}" deleted.`);
+};
+
+const runStatus = async (vmIdArg?: string): Promise<void> => {
+  const db = readVmDatabase();
+  if (vmIdArg) {
+    assertVmId(vmIdArg);
+    const vm = db.vms[vmIdArg];
+    if (!vm) {
+      throw new Error(`VM "${vmIdArg}" does not exist.`);
+    }
+    const running = Boolean(vm.runtime && isProcessAlive(vm.runtime.firecrackerPid));
+    console.log(JSON.stringify({ vm, running }, null, 2));
+    return;
+  }
+
+  const summary = Object.values(db.vms)
+    .sort((a, b) => a.index - b.index)
+    .map((vm) => ({
+      id: vm.vmId,
+      index: vm.index,
+      guestIp: vm.guestIp,
+      tapDev: vm.tapDev,
+      rootfsPath: vm.rootfsPath,
+      running: Boolean(vm.runtime && isProcessAlive(vm.runtime.firecrackerPid)),
+      pid: vm.runtime?.firecrackerPid ?? null,
+    }));
+  console.log(JSON.stringify(summary, null, 2));
+};
+
+const runList = async (): Promise<void> => {
+  await runStatus();
 };
 
 const ensureDirs = (paths: string[]): void => {
@@ -363,6 +518,171 @@ const ensureSudoSession = async (): Promise<void> => {
   }
   logStep("Requesting sudo for network setup...");
   run(["sudo", "-v"], { inherit: true });
+};
+
+const normalizeVmId = (vmId: string | undefined): string => {
+  const value = vmId?.trim();
+  return value && value.length > 0 ? value : DEFAULT_VM_ID;
+};
+
+const assertVmId = (vmId: string): void => {
+  if (/^[a-z0-9][a-z0-9_-]{0,31}$/.test(vmId)) {
+    return;
+  }
+  throw new Error(
+    `Invalid vm-id "${vmId}". Use lowercase letters, digits, '_' and '-' (max 32 chars).`,
+  );
+};
+
+const assertJailerSafeVmId = (vmId: string): void => {
+  if (/^[a-z0-9][a-z0-9_]{0,31}$/.test(vmId)) {
+    return;
+  }
+  throw new Error(
+    `VM "${vmId}" is not jailer-safe. For create/start, use lowercase letters, digits, and '_' only.`,
+  );
+};
+
+const assertJailerSocketPathLength = (vmId: string, execName = "firecracker"): void => {
+  const socketPath = join(JAILER_BASE_DIR, execName, vmId, "root", JAILER_API_SOCKET_IN_JAIL.slice(1));
+  if (socketPath.length <= MAX_UNIX_SOCKET_PATH_LENGTH) {
+    return;
+  }
+
+  const fixedChars = socketPath.length - vmId.length;
+  const maxVmIdLength = Math.max(1, MAX_UNIX_SOCKET_PATH_LENGTH - fixedChars);
+  throw new Error(
+    `VM id "${vmId}" is too long for this host path (socket length ${socketPath.length} > ${MAX_UNIX_SOCKET_PATH_LENGTH}). Max vm-id length here is ${maxVmIdLength}. Use a shorter vm-id or move the repo to a shorter path.`,
+  );
+};
+
+const vmDataDir = (vmId: string): string => join(VMS_DIR, vmId);
+
+const formatHexByte = (value: number): string => value.toString(16).padStart(2, "0").toUpperCase();
+
+const buildVmConfig = (vmId: string, index: number): VmConfig => {
+  const subnetBase = index * 4;
+  const thirdOctet = Math.floor(subnetBase / 256);
+  const fourthBase = subnetBase % 256;
+  if (thirdOctet > 255 || fourthBase > 252) {
+    throw new Error(`VM index ${index} exceeds supported /30 address space.`);
+  }
+
+  const hostLast = fourthBase + 1;
+  const guestLast = fourthBase + 2;
+  const tapDev = `tap-vm${index}`;
+  if (tapDev.length > 15) {
+    throw new Error(`Computed tap device name is too long: ${tapDev}`);
+  }
+
+  return {
+    vmId,
+    tapDev,
+    hostIp: `172.16.${thirdOctet}.${hostLast}`,
+    guestIp: `172.16.${thirdOctet}.${guestLast}`,
+    maskBits: "30",
+    maskLong: "255.255.255.252",
+    guestMac: `06:00:AC:10:${formatHexByte(thirdOctet)}:${formatHexByte(guestLast)}`,
+    apiSocketPath: `/tmp/microvm-${vmId}.firecracker.sock`,
+    logPath: join(RUNTIME_DIR, vmId, "firecracker.log"),
+    sshUser: DEFAULT_VM_SSH_USER,
+  };
+};
+
+const defaultVmDatabase = (): VmDatabase => ({
+  formatVersion: VM_DB_FORMAT_VERSION,
+  nextIndex: 0,
+  vms: {},
+});
+
+const readVmDatabase = (): VmDatabase => {
+  if (!existsSync(VM_DB_FILE)) {
+    return defaultVmDatabase();
+  }
+
+  const parsed = JSON.parse(readFileSync(VM_DB_FILE, "utf8")) as Partial<VmDatabase>;
+  const rawVms = parsed.vms && typeof parsed.vms === "object" ? (parsed.vms as Record<string, VmRecord>) : {};
+  const nextIndex = Number(parsed.nextIndex ?? 0);
+  const normalized: VmDatabase = {
+    formatVersion: VM_DB_FORMAT_VERSION,
+    nextIndex: Number.isFinite(nextIndex) && nextIndex >= 0 ? nextIndex : 0,
+    vms: rawVms,
+  };
+
+  const maxIndex = Object.values(normalized.vms).reduce((max, vm) => {
+    const index = Number(vm.index);
+    return Number.isFinite(index) ? Math.max(max, index) : max;
+  }, -1);
+  normalized.nextIndex = Math.max(normalized.nextIndex, maxIndex + 1);
+  return normalized;
+};
+
+const writeVmDatabase = (db: VmDatabase): void => {
+  writeJson(VM_DB_FILE, {
+    formatVersion: VM_DB_FORMAT_VERSION,
+    nextIndex: db.nextIndex,
+    vms: db.vms,
+  });
+};
+
+const reserveVmIndex = (db: VmDatabase): number => {
+  const usedIndexes = new Set(
+    Object.values(db.vms)
+      .map((vm) => Number(vm.index))
+      .filter((index) => Number.isFinite(index)),
+  );
+  let candidate = Math.max(0, db.nextIndex);
+  while (usedIndexes.has(candidate)) {
+    candidate += 1;
+  }
+  db.nextIndex = candidate + 1;
+  return candidate;
+};
+
+const cloneExt4Rootfs = (sourcePath: string, targetPath: string): void => {
+  if (!existsSync(sourcePath)) {
+    throw new Error(`Base rootfs does not exist: ${sourcePath}`);
+  }
+  if (existsSync(targetPath)) {
+    throw new Error(`Target rootfs already exists: ${targetPath}`);
+  }
+
+  ensureDirs([dirname(targetPath)]);
+  const reflinkCopy = run(["cp", "--reflink=auto", sourcePath, targetPath], { allowFailure: true });
+  if (reflinkCopy.exitCode !== 0) {
+    run(["cp", "-f", sourcePath, targetPath]);
+  }
+  chmodSync(targetPath, 0o644);
+};
+
+const getVmOrThrow = (vmId: string): VmRecord => {
+  const vm = readVmDatabase().vms[vmId];
+  if (!vm) {
+    throw new Error(`VM "${vmId}" does not exist.`);
+  }
+  return vm;
+};
+
+const toSshTarget = (vm: VmRecord): SshTarget => ({
+  sshUser: vm.sshUser,
+  sshKeyPath: vm.sshKeyPath,
+  guestIp: vm.guestIp,
+});
+
+const clearVmRuntime = (vmId: string): void => {
+  const db = readVmDatabase();
+  const vm = db.vms[vmId];
+  if (!vm) return;
+  db.vms[vmId] = { ...vm, runtime: undefined };
+  writeVmDatabase(db);
+};
+
+const cleanupVmRuntime = async (vm: VmRecord): Promise<void> => {
+  if (!vm.runtime) return;
+  stopProcess(vm.runtime.firecrackerPid);
+  safeDelete(vm.runtime.apiSocketPath);
+  await teardownHostNetwork(vm, vm.runtime.hostIface);
+  cleanupJailerVmDir(vm.runtime.jailerVmDir);
 };
 
 const getHostArch = (): string => {
@@ -903,6 +1223,14 @@ const setupHostNetwork = async (config: VmConfig, hostIface: string): Promise<vo
     "-j",
     "ACCEPT",
   ]);
+  ensureIptablesRuleInserted(null, "FORWARD", 1, [
+    "-i",
+    config.tapDev,
+    "-o",
+    "tap-vm+",
+    "-j",
+    "DROP",
+  ]);
 
   // Restrict VM access to host services: allow only Ollama on 11434, drop everything else.
   ensureIptablesRuleInserted(null, "INPUT", 1, [
@@ -970,6 +1298,15 @@ const teardownHostNetwork = async (config: VmConfig, hostIface: string): Promise
     "RELATED,ESTABLISHED",
     "-j",
     "ACCEPT",
+  ]);
+  deleteIptablesRule(null, [
+    "FORWARD",
+    "-i",
+    config.tapDev,
+    "-o",
+    "tap-vm+",
+    "-j",
+    "DROP",
   ]);
   deleteIptablesRule(null, [
     "INPUT",
@@ -1139,20 +1476,20 @@ const firecrackerPut = (socketPath: string, endpoint: string, payload: unknown):
   ]);
 };
 
-const waitForSshReady = async (state: VmState, timeoutMs: number): Promise<void> => {
+const waitForSshReady = async (target: SshTarget, timeoutMs: number): Promise<void> => {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const attempt = run([...sshBaseArgs(state), "true"], { allowFailure: true });
+    const attempt = run([...sshBaseArgs(target), "true"], { allowFailure: true });
     if (attempt.exitCode === 0) return;
     await sleep(1500);
   }
   throw new Error("Timed out waiting for SSH to become available.");
 };
 
-const sshBaseArgs = (state: VmState): string[] => [
+const sshBaseArgs = (target: SshTarget): string[] => [
   "ssh",
   "-i",
-  state.sshKeyPath,
+  target.sshKeyPath,
   "-o",
   "StrictHostKeyChecking=no",
   "-o",
@@ -1163,38 +1500,20 @@ const sshBaseArgs = (state: VmState): string[] => [
   "BatchMode=yes",
   "-o",
   "ConnectTimeout=3",
-  `${state.sshUser}@${state.guestIp}`,
+  `${target.sshUser}@${target.guestIp}`,
 ];
 
-const renderSshCommand = (state: VmState): string =>
+const renderSshCommand = (target: SshTarget): string =>
   [
     "ssh",
     "-i",
-    shellQuote(state.sshKeyPath),
+    shellQuote(target.sshKeyPath),
     "-o",
     "StrictHostKeyChecking=no",
     "-o",
     "UserKnownHostsFile=/dev/null",
-    `${state.sshUser}@${state.guestIp}`,
+    `${target.sshUser}@${target.guestIp}`,
   ].join(" ");
-
-const ensureNoRunningVm = (): void => {
-  const state = readState();
-  if (!state) return;
-
-  if (isProcessAlive(state.firecrackerPid)) {
-    throw new Error(`Existing VM appears to be running (pid ${state.firecrackerPid}). Run "bun src/index.ts down" first.`);
-  }
-
-  safeDelete(STATE_FILE);
-  safeDelete(state.apiSocketPath);
-  cleanupJailerVmDir(state.jailerVmDir);
-};
-
-const readState = (): VmState | null => {
-  if (!existsSync(STATE_FILE)) return null;
-  return JSON.parse(readFileSync(STATE_FILE, "utf8")) as VmState;
-};
 
 const writeJson = (path: string, data: unknown): void => {
   mkdirSync(dirname(path), { recursive: true });
@@ -1220,6 +1539,15 @@ const shellJoin = (args: string[]): string => args.map(shellQuote).join(" ");
 const safeDelete = (path: string): void => {
   if (!existsSync(path)) return;
   rmSync(path, { force: true, recursive: false });
+};
+
+const safeDeleteInsideWorkDir = (path: string): void => {
+  const resolved = resolve(path);
+  const safeBase = resolve(WORK_DIR);
+  if (!(resolved === safeBase || resolved.startsWith(`${safeBase}/`))) {
+    throw new Error(`Refusing to delete path outside work dir: ${resolved}`);
+  }
+  runRoot(["rm", "-rf", resolved], { allowFailure: true });
 };
 
 const isRoot = (): boolean => (typeof process.getuid === "function" ? process.getuid() === 0 : false);
