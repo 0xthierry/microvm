@@ -1,0 +1,49 @@
+FROM archlinux:latest
+
+RUN pacman -Syy --noconfirm archlinux-keyring && \
+    pacman -Syu --noconfirm --needed \
+      systemd \
+      openssh \
+      iproute2 \
+      iputils \
+      procps-ng && \
+    pacman -Scc --noconfirm
+
+RUN useradd -m -u 1000 -U -s /bin/bash thierry && \
+    echo 'root:root' | chpasswd && \
+    echo 'thierry:thierry' | chpasswd
+
+RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
+
+RUN mkdir -p /etc/ssh/sshd_config.d && \
+    printf '%s\n' \
+      'PermitRootLogin yes' \
+      'PasswordAuthentication no' \
+      'KbdInteractiveAuthentication no' \
+      'ChallengeResponseAuthentication no' \
+      'UsePAM yes' \
+      'PubkeyAuthentication yes' \
+      'AuthenticationMethods publickey' \
+      > /etc/ssh/sshd_config.d/zz-firecracker.conf
+
+RUN ssh-keygen -A
+
+RUN mkdir -p /etc/systemd/system/multi-user.target.wants && \
+    ln -sf /usr/lib/systemd/system/sshd.service /etc/systemd/system/multi-user.target.wants/sshd.service && \
+    ln -sf /usr/lib/systemd/system/systemd-networkd.service /etc/systemd/system/multi-user.target.wants/systemd-networkd.service && \
+    ln -sf /usr/lib/systemd/system/serial-getty@ttyS0.service /etc/systemd/system/multi-user.target.wants/serial-getty@ttyS0.service
+
+RUN mkdir -p /etc/systemd/network && \
+    printf '%s\n' \
+      '[Match]' \
+      'Name=eth0' \
+      '' \
+      '[Network]' \
+      'Address=172.16.0.2/30' \
+      'Gateway=172.16.0.1' \
+      'DNS=1.1.1.1' \
+      'DNS=8.8.8.8' \
+      > /etc/systemd/network/20-eth0.network
+
+RUN echo arch-fc-vm > /etc/hostname && \
+    truncate -s 0 /etc/machine-id
