@@ -67,6 +67,13 @@ type JailerLayout = {
   apiSocketHostPath: string;
 };
 
+type JailerProfile = {
+  cgroupVersion: "2";
+  parentCgroup: string;
+  cgroups: string[];
+  resourceLimits: string[];
+};
+
 type VmState = VmConfig & {
   firecrackerPid: number;
   hostIface: string;
@@ -101,6 +108,13 @@ const JAILER_BASE_DIR = resolve(WORK_DIR, "jailer");
 const JAILER_API_SOCKET_IN_JAIL = "/firecracker.socket";
 const JAILER_KERNEL_PATH_IN_JAIL = "/kernel/vmlinux";
 const JAILER_ROOTFS_PATH_IN_JAIL = "/rootfs.ext4";
+const DEFAULT_JAILER_PARENT_CGROUP = "microvm";
+const DEFAULT_CGROUP_MEMORY_MAX = "1610612736";
+const DEFAULT_CGROUP_MEMORY_SWAP_MAX = "0";
+const DEFAULT_CGROUP_CPU_MAX = "200000 100000";
+const DEFAULT_CGROUP_PIDS_MAX = "512";
+const DEFAULT_RLIMIT_NOFILE = "1024";
+const DEFAULT_RLIMIT_FSIZE = "2147483648";
 
 const DEFAULTS: VmConfig = {
   vmId: "vm0",
@@ -193,6 +207,7 @@ const runUp = async (attach: boolean): Promise<void> => {
 
   const firecrackerBinaryPath = resolveBinaryPath("firecracker");
   const jailerBinaryPath = resolveBinaryPath("jailer");
+  const jailerProfile = resolveJailerProfile();
   const vmUid = String(getRuntimeUid());
   const vmGid = String(getRuntimeGid());
   const jailerLayout = prepareJailerLayout({
@@ -224,6 +239,7 @@ const runUp = async (attach: boolean): Promise<void> => {
       jailerBaseDir: JAILER_BASE_DIR,
       runtimeUid: vmUid,
       runtimeGid: vmGid,
+      jailerProfile,
       logPath: DEFAULTS.logPath,
     });
     await waitForFirecrackerApi(jailerLayout.apiSocketHostPath, 10_000);
@@ -753,6 +769,7 @@ const launchJailedFirecracker = ({
   jailerBaseDir,
   runtimeUid,
   runtimeGid,
+  jailerProfile,
   logPath,
 }: {
   vmId: string;
@@ -761,6 +778,7 @@ const launchJailedFirecracker = ({
   jailerBaseDir: string;
   runtimeUid: string;
   runtimeGid: string;
+  jailerProfile: JailerProfile;
   logPath: string;
 }): number => {
   mkdirSync(dirname(logPath), { recursive: true });
@@ -775,6 +793,12 @@ const launchJailedFirecracker = ({
     runtimeUid,
     "--gid",
     runtimeGid,
+    "--cgroup-version",
+    jailerProfile.cgroupVersion,
+    "--parent-cgroup",
+    jailerProfile.parentCgroup,
+    ...jailerProfile.cgroups.flatMap((cgroup) => ["--cgroup", cgroup]),
+    ...jailerProfile.resourceLimits.flatMap((resource) => ["--resource-limit", resource]),
     "--chroot-base-dir",
     jailerBaseDir,
     "--",
@@ -799,6 +823,46 @@ const cleanupJailerVmDir = (vmDir: string | undefined): void => {
     return;
   }
   runRoot(["rm", "-rf", resolved], { allowFailure: true });
+};
+
+const resolveJailerProfile = (): JailerProfile => {
+  ensureCgroupV2Available();
+
+  const parentCgroup = envOrDefault("MICROVM_CGROUP_PARENT", DEFAULT_JAILER_PARENT_CGROUP);
+  const memoryMax = envOrDefault("MICROVM_CGROUP_MEMORY_MAX", DEFAULT_CGROUP_MEMORY_MAX);
+  const memorySwapMax = envOrDefault("MICROVM_CGROUP_MEMORY_SWAP_MAX", DEFAULT_CGROUP_MEMORY_SWAP_MAX);
+  const cpuMax = envOrDefault("MICROVM_CGROUP_CPU_MAX", DEFAULT_CGROUP_CPU_MAX);
+  const pidsMax = envOrDefault("MICROVM_CGROUP_PIDS_MAX", DEFAULT_CGROUP_PIDS_MAX);
+  const rlimitNoFile = envOrDefault("MICROVM_RLIMIT_NOFILE", DEFAULT_RLIMIT_NOFILE);
+  const rlimitFsize = envOrDefault("MICROVM_RLIMIT_FSIZE", DEFAULT_RLIMIT_FSIZE);
+
+  return {
+    cgroupVersion: "2",
+    parentCgroup,
+    cgroups: [
+      `memory.max=${memoryMax}`,
+      `memory.swap.max=${memorySwapMax}`,
+      `cpu.max=${cpuMax}`,
+      `pids.max=${pidsMax}`,
+    ],
+    resourceLimits: [
+      `no-file=${rlimitNoFile}`,
+      `fsize=${rlimitFsize}`,
+    ],
+  };
+};
+
+const ensureCgroupV2Available = (): void => {
+  if (!existsSync("/sys/fs/cgroup/cgroup.controllers")) {
+    throw new Error(
+      "cgroup v2 was requested for jailer profile but /sys/fs/cgroup/cgroup.controllers is missing.",
+    );
+  }
+};
+
+const envOrDefault = (name: string, fallback: string): string => {
+  const value = process.env[name]?.trim();
+  return value && value.length > 0 ? value : fallback;
 };
 
 const setupHostNetwork = async (config: VmConfig, hostIface: string): Promise<void> => {
