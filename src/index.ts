@@ -3,8 +3,10 @@
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   renameSync,
   rmSync,
   statSync,
@@ -1203,10 +1205,10 @@ const injectAuthorizedKeyAtHome = (homePath: string, sshPublicKeyPath: string, o
 };
 
 const validateRootfsForBoot = (treePath: string, sshUser: string): void => {
-  assertExecutable(join(treePath, "sbin", "init"), "Rootfs is missing /sbin/init");
+  assertExecutableInRootfs(treePath, "/sbin/init", "Rootfs is missing /sbin/init");
 
-  const sshdCandidates = [join(treePath, "usr", "bin", "sshd"), join(treePath, "usr", "sbin", "sshd")];
-  const hasSshd = sshdCandidates.some((candidate) => runRoot(["test", "-x", candidate], { allowFailure: true }).exitCode === 0);
+  const sshdCandidates = ["/usr/bin/sshd", "/usr/sbin/sshd"];
+  const hasSshd = sshdCandidates.some((candidate) => hasExecutableInRootfs(treePath, candidate));
   if (!hasSshd) {
     throw new Error("Rootfs is missing sshd binary (expected /usr/bin/sshd or /usr/sbin/sshd).");
   }
@@ -1246,11 +1248,44 @@ const recommendedRootfsSizeMiB = (treePath: string): number => {
   return Math.max(1024, used + 256);
 };
 
-const assertExecutable = (path: string, message: string): void => {
-  if (runRoot(["test", "-x", path], { allowFailure: true }).exitCode === 0) {
+const hasExecutableInRootfs = (treePath: string, rootfsPath: string): boolean => {
+  try {
+    const resolvedPath = resolveRootfsPath(treePath, rootfsPath);
+    return (statSync(resolvedPath).mode & 0o111) !== 0;
+  } catch {
+    return false;
+  }
+};
+
+const assertExecutableInRootfs = (treePath: string, rootfsPath: string, message: string): void => {
+  if (hasExecutableInRootfs(treePath, rootfsPath)) {
     return;
   }
-  throw new Error(`${message}: ${path}`);
+  throw new Error(`${message}: ${join(treePath, rootfsPath.replace(/^\/+/, ""))}`);
+};
+
+const resolveRootfsPath = (treePath: string, rootfsPath: string): string => {
+  const root = resolve(treePath);
+  let current = join(root, rootfsPath.replace(/^\/+/, ""));
+
+  for (let hop = 0; hop < 40; hop += 1) {
+    const currentResolved = resolve(current);
+    if (!(currentResolved === root || currentResolved.startsWith(`${root}/`))) {
+      throw new Error(`Resolved rootfs path escapes root tree: ${currentResolved}`);
+    }
+
+    const entry = lstatSync(currentResolved);
+    if (!entry.isSymbolicLink()) {
+      return currentResolved;
+    }
+
+    const linkTarget = readlinkSync(currentResolved);
+    current = linkTarget.startsWith("/")
+      ? join(root, linkTarget.replace(/^\/+/, ""))
+      : resolve(dirname(currentResolved), linkTarget);
+  }
+
+  throw new Error(`Too many symbolic links while resolving rootfs path: ${rootfsPath}`);
 };
 
 const assertPasswdUserExists = (treePath: string, username: string): void => {
