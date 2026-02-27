@@ -1,4 +1,5 @@
 import type { AppConfig } from "../config/app-config";
+import { z } from "zod";
 import type { ProcessService } from "./process";
 
 type NetworkConfig = {
@@ -21,6 +22,9 @@ export const createNetworkManagerService = ({
   process: ProcessService;
   appConfig: AppConfig;
 }): NetworkManagerService => {
+  const defaultRouteListSchema = z.array(z.object({
+    dev: z.string().optional(),
+  }));
   const hostAllowedTcpPort = appConfig.defaults.network.hostAllowedTcpPort;
   const tableArgs = (table: string | null): string[] => (table ? ["-t", table] : []);
 
@@ -54,7 +58,17 @@ export const createNetworkManagerService = ({
 
   const getDefaultHostIface = (): string => {
     const result = process.run(["ip", "-j", "route", "list", "default"]);
-    const routes = JSON.parse(result.stdout) as Array<{ dev?: string }>;
+    let payload: unknown;
+    try {
+      payload = JSON.parse(result.stdout);
+    } catch {
+      throw new Error("Cannot parse `ip -j route` output while determining default host interface.");
+    }
+    const parsed = defaultRouteListSchema.safeParse(payload);
+    if (!parsed.success) {
+      throw new Error("Unexpected `ip -j route` JSON format while determining default host interface.");
+    }
+    const routes = parsed.data;
     const dev = routes[0]?.dev;
     if (!dev) {
       throw new Error("Cannot determine default host interface from `ip route`.");

@@ -6,7 +6,7 @@ export type RuntimePaths = {
   artifactsDir: string;
   runtimeDir: string;
   vmsDir: string;
-  vmDbFile: string;
+  vmDatabaseFile: string;
   defaultRootfsDockerfile: string;
   rootfsTmpDir: string;
   jailerBaseDir: string;
@@ -23,7 +23,7 @@ export const buildRuntimePaths = ({ projectRoot }: { projectRoot: string }): Run
     artifactsDir,
     runtimeDir: join(workDir, "runtime"),
     vmsDir: join(workDir, "vms"),
-    vmDbFile: join(workDir, "runtime", "vms.json"),
+    vmDatabaseFile: join(workDir, "runtime", "vms.json"),
     defaultRootfsDockerfile: resolve(projectRoot, "Dockerfile.arch"),
     rootfsTmpDir: resolve(workDir, "tmp"),
     jailerBaseDir: resolve(workDir, "jailer"),

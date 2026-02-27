@@ -12,6 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { z } from "zod";
 
 import type { AppConfig } from "../config/app-config";
 import type { ProcessService } from "./process";
@@ -36,6 +37,16 @@ type RootfsBuildMeta = {
   source: string;
   builtAt: string;
 };
+
+const rootfsBuildMetaSchema = z.object({
+  formatVersion: z.number().int().nonnegative(),
+  dockerfilePath: z.string().min(1),
+  dockerfileSha256: z.string().min(1),
+  sshPubKeySha256: z.string().min(1),
+  sshUser: z.string().min(1),
+  source: z.string().min(1),
+  builtAt: z.string().min(1),
+});
 
 export type RootfsProvisionerService = {
   ensureSshKeyPair: (privateKeyPath: string) => SshKeyPair;
@@ -63,14 +74,16 @@ export const createRootfsProvisionerService = ({
     paths.forEach((path) => mkdirSync(path, { recursive: true }));
   };
 
-  const safeDelete = (path: string): void => {
+  const deleteFileIfExists = (path: string): void => {
     if (!existsSync(path)) return;
     rmSync(path, { force: true, recursive: false });
   };
 
   const writeJson = (path: string, data: unknown): void => {
     mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
+    const tempPath = `${path}.tmp.${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+    writeFileSync(tempPath, `${JSON.stringify(data, null, 2)}\n`);
+    renameSync(tempPath, path);
   };
 
   const sha256OfFile = (path: string): string => createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -202,8 +215,8 @@ export const createRootfsProvisionerService = ({
       return { privateKeyPath, publicKeyPath };
     }
 
-    safeDelete(privateKeyPath);
-    safeDelete(publicKeyPath);
+    deleteFileIfExists(privateKeyPath);
+    deleteFileIfExists(publicKeyPath);
 
     logStep(`generate ssh key: ${privateKeyPath}`);
     process.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", privateKeyPath, "-C", "microvm-access"], {
@@ -241,20 +254,27 @@ export const createRootfsProvisionerService = ({
     const contextPath = dirname(dockerfilePath);
 
     if (existsSync(ext4Path) && existsSync(metaPath)) {
-      const meta = JSON.parse(readFileSync(metaPath, "utf8")) as RootfsBuildMeta;
-      if (
-        meta.formatVersion === rootfsBuildFormatVersion &&
-        meta.dockerfilePath === dockerfilePath &&
-        meta.dockerfileSha256 === dockerfileSha &&
-        meta.sshPubKeySha256 === sshPubKeySha &&
-        meta.sshUser === sshUser
-      ) {
-        logStep(`reuse: ${ext4Path}`);
-        return {
-          source,
-          ext4Path,
-          buildHash,
-        };
+      try {
+        const parsed = rootfsBuildMetaSchema.safeParse(JSON.parse(readFileSync(metaPath, "utf8")));
+        if (parsed.success) {
+          const meta: RootfsBuildMeta = parsed.data;
+          if (
+            meta.formatVersion === rootfsBuildFormatVersion &&
+            meta.dockerfilePath === dockerfilePath &&
+            meta.dockerfileSha256 === dockerfileSha &&
+            meta.sshPubKeySha256 === sshPubKeySha &&
+            meta.sshUser === sshUser
+          ) {
+            logStep(`reuse: ${ext4Path}`);
+            return {
+              source,
+              ext4Path,
+              buildHash,
+            };
+          }
+        }
+      } catch {
+        // Ignore invalid metadata and rebuild artifact.
       }
     }
 
@@ -286,15 +306,20 @@ export const createRootfsProvisionerService = ({
       injectAuthorizedKeys(treePath, sshPublicKeyPath, sshUser);
 
       const sizeMib = recommendedRootfsSizeMiB(treePath);
-      const ext4TempPath = `${ext4Path}.tmp`;
+      const ext4TempPath = `${ext4Path}.tmp.${buildId}`;
 
-      safeDelete(ext4TempPath);
+      deleteFileIfExists(ext4TempPath);
       process.run(["truncate", "-s", `${sizeMib}M`, ext4TempPath]);
       logStep(`creating ext4 rootfs (${sizeMib} MiB): ${ext4Path}`);
       process.runRoot(["mkfs.ext4", "-F", "-d", treePath, ext4TempPath]);
 
-      renameSync(ext4TempPath, ext4Path);
-      chmodSync(ext4Path, 0o644);
+      if (existsSync(ext4Path)) {
+        deleteFileIfExists(ext4TempPath);
+        logStep(`reuse: ${ext4Path}`);
+      } else {
+        renameSync(ext4TempPath, ext4Path);
+        chmodSync(ext4Path, 0o644);
+      }
 
       const meta: RootfsBuildMeta = {
         formatVersion: rootfsBuildFormatVersion,

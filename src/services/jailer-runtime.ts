@@ -69,13 +69,13 @@ export const createJailerRuntimeService = ({
   const defaultRlimitNofile = appConfig.defaults.jailer.rlimitNofile;
   const defaultRlimitFsize = appConfig.defaults.jailer.rlimitFsize;
 
-  const parsePositiveInt = (raw: string, flagName: string): number => {
+  const parsePositiveIntSetting = (raw: string, settingName: string): number => {
     if (!/^\d+$/.test(raw)) {
-      throw new Error(`Flag --${flagName} expects a positive integer, got "${raw}".`);
+      throw new Error(`Setting ${settingName} expects a positive integer, got "${raw}".`);
     }
     const value = Number(raw);
     if (!Number.isSafeInteger(value) || value <= 0) {
-      throw new Error(`Flag --${flagName} expects a positive integer, got "${raw}".`);
+      throw new Error(`Setting ${settingName} expects a positive integer, got "${raw}".`);
     }
     return value;
   };
@@ -260,7 +260,7 @@ export const createJailerRuntimeService = ({
     const cpuMax = envOrDefault(env.MICROVM_CGROUP_CPU_MAX, defaultCgroupCpuMax);
     const pidsMax = envOrDefault(env.MICROVM_CGROUP_PIDS_MAX, defaultCgroupPidsMax);
     const rlimitNoFile = envOrDefault(env.MICROVM_RLIMIT_NOFILE, defaultRlimitNofile);
-    const configuredFsize = parsePositiveInt(
+    const configuredFsize = parsePositiveIntSetting(
       envOrDefault(env.MICROVM_RLIMIT_FSIZE, defaultRlimitFsize),
       "MICROVM_RLIMIT_FSIZE",
     );

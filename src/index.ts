@@ -12,7 +12,7 @@ import { createJailerRuntimeService } from "./services/jailer-runtime";
 import { createKernelArtifactResolverService } from "./services/kernel-artifact-resolver";
 import { createNetworkManagerService } from "./services/network-manager";
 import { createProcessService } from "./services/process";
-import { createVmRepository } from "./services/persistance/vm-repository";
+import { createVmRepository } from "./services/persistence/vm-repository";
 import { createRootfsProvisionerService } from "./services/rootfs-provisioner";
 import { createSshClientService } from "./services/ssh-client";
 import { createVmIdPolicyService } from "./services/vm-id-policy";

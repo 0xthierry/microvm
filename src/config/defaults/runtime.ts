@@ -1,4 +1,4 @@
 export const runtimeDefaults = {
   rootfsBuildFormatVersion: 2,
-  vmDbFormatVersion: 1,
+  vmDatabaseFormatVersion: 1,
 } as const;

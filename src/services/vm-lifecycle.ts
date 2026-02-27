@@ -8,7 +8,7 @@ import type { HostPrerequisitesService } from "./host-prerequisites";
 import type { JailerRuntimeService } from "./jailer-runtime";
 import type { KernelArtifactResolverService } from "./kernel-artifact-resolver";
 import type { NetworkManagerService } from "./network-manager";
-import type { VmRepository } from "./persistance/vm-repository";
+import type { VmRepository } from "./persistence/vm-repository";
 import type { ProcessService } from "./process";
 import type { RootfsProvisionerService } from "./rootfs-provisioner";
 import type { SshClientService } from "./ssh-client";
@@ -90,7 +90,7 @@ export type VmLifecycleService = {
   runSet: (vmId: string, options: SetVmOptions) => Promise<void>;
   runDelete: (vmId: string) => Promise<void>;
   runSsh: (vmId: string) => Promise<void>;
-  runStatus: (vmIdArg?: string) => Promise<void>;
+  runStatus: (vmId?: string) => Promise<void>;
   runList: () => Promise<void>;
 };
 
@@ -201,12 +201,12 @@ export const createVmLifecycleService = ({
     processService.run(["kill", "-KILL", String(pid)], { allowFailure: true });
   };
 
-  const safeDelete = (path: string): void => {
+  const deleteFileIfExists = (path: string): void => {
     if (!existsSync(path)) return;
     rmSync(path, { force: true, recursive: false });
   };
 
-  const safeDeleteInsideWorkDir = (path: string): void => {
+  const deletePathInsideWorkDir = (path: string): void => {
     const resolved = resolve(path);
     const safeBase = resolve(paths.workDir);
     if (!(resolved === safeBase || resolved.startsWith(`${safeBase}/`))) {
@@ -218,7 +218,7 @@ export const createVmLifecycleService = ({
   const cleanupVmRuntime = async (vm: VmRecord): Promise<void> => {
     if (!vm.runtime) return;
     stopProcess(vm.runtime.firecrackerPid);
-    safeDelete(vm.runtime.apiSocketPath);
+    deleteFileIfExists(vm.runtime.apiSocketPath);
     await networkManager.teardownHostNetwork(vm, vm.runtime.hostIface);
     jailerRuntime.cleanupJailerVmDir(vm.runtime.jailerVmDir);
   };
@@ -231,8 +231,8 @@ export const createVmLifecycleService = ({
     hostPrerequisites.ensureDependencies(["docker", "mkfs.ext4", "tar", "ssh-keygen", "sudo", "e2fsck", "resize2fs"]);
     await hostPrerequisites.ensureSudoSession();
 
-    const db = vmRepository.readVmDatabase();
-    if (db.vms[vmId]) {
+    const existingVm = vmRepository.readVmDatabase().vms[vmId];
+    if (existingVm) {
       throw new Error(`VM "${vmId}" already exists.`);
     }
 
@@ -243,25 +243,29 @@ export const createVmLifecycleService = ({
       sshUser: options.sshUser,
     });
 
-    const index = vmRepository.reserveVmIndex(db);
-    const config = buildVmConfig(vmId, index, options);
     const vmRootfsPath = join(vmDataDir(vmId), "rootfs.ext4");
     diskImageService.cloneExt4Rootfs(rootfs.ext4Path, vmRootfsPath);
     diskImageService.growExt4DiskIfNeeded(vmRootfsPath, options.diskSizeMib);
     chmodSync(sshKeyPair.privateKeyPath, 0o600);
 
-    const record: VmRecord = {
-      ...config,
-      index,
-      rootfsPath: vmRootfsPath,
-      sshKeyPath: sshKeyPair.privateKeyPath,
-      sshPublicKeyPath: sshKeyPair.publicKeyPath,
-      rootfsSource: rootfs.source,
-      rootfsBuildHash: rootfs.buildHash,
-      createdAt: new Date().toISOString(),
-    };
-    db.vms[vmId] = record;
-    vmRepository.writeVmDatabase(db);
+    vmRepository.updateVmDatabase((db) => {
+      if (db.vms[vmId]) {
+        throw new Error(`VM "${vmId}" already exists.`);
+      }
+      const index = vmRepository.reserveVmIndex(db);
+      const config = buildVmConfig(vmId, index, options);
+      const record: VmRecord = {
+        ...config,
+        index,
+        rootfsPath: vmRootfsPath,
+        sshKeyPath: sshKeyPair.privateKeyPath,
+        sshPublicKeyPath: sshKeyPair.publicKeyPath,
+        rootfsSource: rootfs.source,
+        rootfsBuildHash: rootfs.buildHash,
+        createdAt: new Date().toISOString(),
+      };
+      db.vms[vmId] = record;
+    });
     logStep(
       `created VM "${vmId}" with cpus=${options.vcpuCount}, memory=${options.memSizeMib} MiB, disk=${options.diskSizeMib} MiB, ssh-user=${options.sshUser}`,
     );
@@ -382,15 +386,17 @@ export const createVmLifecycleService = ({
         kernelVersion: kernel.version,
         startedAt: new Date().toISOString(),
       };
-      db = vmRepository.readVmDatabase();
-      const persistedVm = db.vms[vmId];
-      if (!persistedVm) {
-        throw new Error(`VM "${vmId}" not found while persisting runtime state.`);
-      }
-      db.vms[vmId] = { ...persistedVm, runtime };
-      vmRepository.writeVmDatabase(db);
+      const persistedVm = vmRepository.updateVmDatabase((currentDb) => {
+        const currentVm = currentDb.vms[vmId];
+        if (!currentVm) {
+          throw new Error(`VM "${vmId}" not found while persisting runtime state.`);
+        }
+        const updatedVm = { ...currentVm, runtime };
+        currentDb.vms[vmId] = updatedVm;
+        return updatedVm;
+      });
 
-      const sshTarget = toSshTarget(db.vms[vmId]);
+      const sshTarget = toSshTarget(persistedVm);
       await sshClient.waitForSshReady(sshTarget, 120_000);
       logStep(`VM "${vmId}" is ready. SSH command: ${sshClient.renderSshCommand(sshTarget)}`);
 
@@ -474,14 +480,19 @@ export const createVmLifecycleService = ({
       logStep(`resized disk for "${vmId}" from ${vm.diskSizeMib} MiB to ${nextDisk} MiB.`);
     }
 
-    db.vms[vmId] = {
-      ...vm,
-      vcpuCount: nextVcpu,
-      memSizeMib: nextMem,
-      diskSizeMib: nextDisk,
-      sshUser: nextSshUser,
-    };
-    vmRepository.writeVmDatabase(db);
+    vmRepository.updateVmDatabase((currentDb) => {
+      const currentVm = currentDb.vms[vmId];
+      if (!currentVm) {
+        throw new Error(`VM "${vmId}" does not exist.`);
+      }
+      currentDb.vms[vmId] = {
+        ...currentVm,
+        vcpuCount: nextVcpu,
+        memSizeMib: nextMem,
+        diskSizeMib: nextDisk,
+        sshUser: nextSshUser,
+      };
+    });
     logStep(
       `updated "${vmId}": cpus=${nextVcpu}, memory=${nextMem} MiB, disk=${nextDisk} MiB, ssh-user=${nextSshUser}${running ? " (cpu/memory apply on next start)" : ""}`,
     );
@@ -502,26 +513,27 @@ export const createVmLifecycleService = ({
       await cleanupVmRuntime(vm);
     }
 
-    safeDelete(vm.apiSocketPath);
-    safeDeleteInsideWorkDir(vmDataDir(vmId));
-    safeDeleteInsideWorkDir(join(paths.runtimeDir, vmId));
+    deleteFileIfExists(vm.apiSocketPath);
+    deletePathInsideWorkDir(vmDataDir(vmId));
+    deletePathInsideWorkDir(join(paths.runtimeDir, vmId));
     jailerRuntime.cleanupJailerVmDir(
       vm.runtime?.jailerVmDir ?? join(paths.jailerBaseDir, "firecracker", vmId),
     );
 
-    delete db.vms[vmId];
-    vmRepository.writeVmDatabase(db);
+    vmRepository.updateVmDatabase((currentDb) => {
+      delete currentDb.vms[vmId];
+    });
 
     logStep(`VM "${vmId}" deleted.`);
   };
 
-  const runStatus = async (vmIdArg?: string): Promise<void> => {
+  const runStatus = async (vmId?: string): Promise<void> => {
     const db = vmRepository.readVmDatabase();
-    if (vmIdArg) {
-      vmIdPolicy.assertVmId(vmIdArg);
-      const vm = db.vms[vmIdArg];
+    if (vmId) {
+      vmIdPolicy.assertVmId(vmId);
+      const vm = db.vms[vmId];
       if (!vm) {
-        throw new Error(`VM "${vmIdArg}" does not exist.`);
+        throw new Error(`VM "${vmId}" does not exist.`);
       }
       const running = Boolean(vm.runtime && isProcessAlive(vm.runtime.firecrackerPid));
       console.log(JSON.stringify({ vm, running }, null, 2));

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 import type { AppConfig } from "../config/app-config";
@@ -119,9 +119,14 @@ export const createKernelArtifactResolverService = ({
       throw new Error(`Download failed (${response.status}) for ${url}`);
     }
 
-    const tempPath = `${path}.tmp`;
+    const tempPath = `${path}.tmp.${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
     const bytes = new Uint8Array(await response.arrayBuffer());
     writeFileSync(tempPath, bytes);
+    if (existsSync(path)) {
+      rmSync(tempPath, { force: true });
+      logStep(`reuse: ${path}`);
+      return;
+    }
     renameSync(tempPath, path);
   };
 
