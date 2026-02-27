@@ -15,6 +15,9 @@ import {
 import { createHash } from "node:crypto";
 import { basename, dirname, join, resolve } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import type { ParsedArgs } from "./cli/command";
+import { createCommandRegistry } from "./commands/register";
+import type { CommandDeps, CreateVmOptions, SetVmOptions } from "./commands/types";
 
 type CommandResult = {
   exitCode: number;
@@ -121,26 +124,6 @@ type SshTarget = {
   guestIp: string;
 };
 
-type ParsedArgs = {
-  positionals: string[];
-  flags: Map<string, string | boolean>;
-};
-
-type CreateVmOptions = {
-  vcpuCount: number;
-  memSizeMib: number;
-  diskSizeMib: number;
-  dockerfilePath: string;
-  sshUser: string;
-};
-
-type SetVmOptions = {
-  vcpuCount?: number;
-  memSizeMib?: number;
-  diskSizeMib?: number;
-  sshUser?: string;
-};
-
 const PROJECT_ROOT = process.cwd();
 const WORK_DIR = resolve(PROJECT_ROOT, ".microvm");
 const ARTIFACTS_DIR = join(WORK_DIR, "artifacts");
@@ -171,140 +154,50 @@ const DEFAULT_RLIMIT_FSIZE = "2147483648";
 const SHARED_SSH_PRIVATE_KEY_PATH = resolve(ARTIFACTS_DIR, "keys", "microvm.id_ed25519");
 const MAX_UNIX_SOCKET_PATH_LENGTH = 107;
 
-const HELP = `
-Usage:
-  bun src/index.ts create [vm-id] [--cpus N] [--memory-mib N] [--disk-gib N|--disk-mib N] [--dockerfile PATH] [--ssh-user USER]
-  bun src/index.ts start [vm-id] [--no-attach]
-  bun src/index.ts set [vm-id] [--cpus N] [--memory-mib N] [--disk-gib N|--disk-mib N] [--ssh-user USER]
-  bun src/index.ts stop [vm-id]
-  bun src/index.ts delete [vm-id]
-  bun src/index.ts ssh [vm-id]
-  bun src/index.ts status [vm-id]
-  bun src/index.ts list
-  bun src/index.ts up [vm-id] [--no-attach] [create flags...]   # alias for start with auto-create
-  bun src/index.ts down [vm-id]                # alias for stop
-
-Notes:
-  - default vm-id is "${DEFAULT_VM_ID}" when omitted
-  - defaults: ${DEFAULT_VM_VCPU_COUNT} CPU, ${DEFAULT_VM_MEM_SIZE_MIB} MiB RAM, ${DEFAULT_VM_DISK_SIZE_MIB / 1024} GiB disk, Dockerfile.arch, ssh-user=${DEFAULT_VM_SSH_USER}
-  - create builds/reuses a cached Dockerfile-based ext4 and clones per-VM ext4
-  - each VM has isolated disk (.microvm/vms/<vm-id>/rootfs.ext4)
-  - VM registry persists in .microvm/runtime/vms.json
-`.trim();
-
 const decoder = new TextDecoder();
+
+const HELP_NOTES = [
+  `default vm-id is "${DEFAULT_VM_ID}" when omitted`,
+  `defaults: ${DEFAULT_VM_VCPU_COUNT} CPU, ${DEFAULT_VM_MEM_SIZE_MIB} MiB RAM, ${DEFAULT_VM_DISK_SIZE_MIB / 1024} GiB disk, Dockerfile.arch, ssh-user=${DEFAULT_VM_SSH_USER}`,
+  "create builds/reuses a cached Dockerfile-based ext4 and clones per-VM ext4",
+  "each VM has isolated disk (.microvm/vms/<vm-id>/rootfs.ext4)",
+  "VM registry persists in .microvm/runtime/vms.json",
+];
+
+const buildCommandDeps = (renderHelp: () => string): CommandDeps => ({
+  normalizeVmId,
+  assertVmId,
+  assertJailerSafeVmId,
+  assertJailerSocketPathLength,
+  parseCreateOptions,
+  parseSetOptions,
+  getBooleanFlag,
+  runCreate,
+  runStart,
+  runStop,
+  runSet,
+  runDelete,
+  runSsh,
+  runStatus,
+  runList,
+  renderHelp,
+});
 
 const main = async (): Promise<void> => {
   const rawArgs = process.argv.slice(2);
-  const command = rawArgs[0] ?? "up";
+  const commandToken = rawArgs[0] ?? "up";
   const parsed = parseArgs(rawArgs.slice(1));
-  const vmId = normalizeVmId(parsed.positionals[0]);
 
-  if (command === "create") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
-    assertAllowedFlags(parsed.flags, [
-      "cpus",
-      "memory-mib",
-      "disk-mib",
-      "disk-gib",
-      "dockerfile",
-      "ssh-user",
-    ]);
-    await runCreate(vmId, parseCreateOptions(parsed.flags));
-    return;
+  let renderHelp = (): string => "";
+  const deps = buildCommandDeps(() => renderHelp());
+  const registry = createCommandRegistry(deps);
+  renderHelp = (): string => registry.renderHelp(HELP_NOTES);
+
+  const command = registry.resolve(commandToken);
+  if (!command) {
+    throw new Error(`Unknown command "${commandToken}".\n\n${renderHelp()}`);
   }
-
-  if (command === "start") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
-    assertAllowedFlags(parsed.flags, [
-      "no-attach",
-      "cpus",
-      "memory-mib",
-      "disk-mib",
-      "disk-gib",
-      "dockerfile",
-      "ssh-user",
-    ]);
-    await runStart(vmId, !getBooleanFlag(parsed.flags, "no-attach"), false, parseCreateOptions(parsed.flags));
-    return;
-  }
-
-  if (command === "up") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
-    assertAllowedFlags(parsed.flags, [
-      "no-attach",
-      "cpus",
-      "memory-mib",
-      "disk-mib",
-      "disk-gib",
-      "dockerfile",
-      "ssh-user",
-    ]);
-    await runStart(vmId, !getBooleanFlag(parsed.flags, "no-attach"), true, parseCreateOptions(parsed.flags));
-    return;
-  }
-
-  if (command === "stop") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
-    assertAllowedFlags(parsed.flags, []);
-    await runStop(vmId);
-    return;
-  }
-
-  if (command === "set") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
-    assertAllowedFlags(parsed.flags, [
-      "cpus",
-      "memory-mib",
-      "disk-mib",
-      "disk-gib",
-      "ssh-user",
-    ]);
-    await runSet(vmId, parseSetOptions(parsed.flags));
-    return;
-  }
-
-  if (command === "delete") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
-    assertAllowedFlags(parsed.flags, []);
-    await runDelete(vmId);
-    return;
-  }
-
-  if (command === "down") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
-    assertAllowedFlags(parsed.flags, []);
-    await runStop(vmId);
-    return;
-  }
-
-  if (command === "ssh") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
-    assertAllowedFlags(parsed.flags, []);
-    await runSsh(vmId);
-    return;
-  }
-
-  if (command === "status") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
-    assertAllowedFlags(parsed.flags, []);
-    await runStatus(parsed.positionals[0]);
-    return;
-  }
-
-  if (command === "list") {
-    assertNoUnexpectedPositionals(command, parsed.positionals, 0);
-    assertAllowedFlags(parsed.flags, []);
-    await runList();
-    return;
-  }
-
-  if (command === "help" || command === "--help" || command === "-h") {
-    console.log(HELP);
-    return;
-  }
-
-  throw new Error(`Unknown command "${command}".\n\n${HELP}`);
+  await command.execute(parsed);
 };
 
 const parseArgs = (args: string[]): ParsedArgs => {
@@ -341,21 +234,6 @@ const parseArgs = (args: string[]): ParsedArgs => {
   }
 
   return { positionals, flags };
-};
-
-const assertNoUnexpectedPositionals = (command: string, positionals: string[], maxCount: number): void => {
-  if (positionals.length <= maxCount) return;
-  throw new Error(
-    `Too many positional arguments for "${command}". Received: ${positionals.join(" ")}`,
-  );
-};
-
-const assertAllowedFlags = (flags: Map<string, string | boolean>, allowed: string[]): void => {
-  const allowedSet = new Set(allowed);
-  const unknown = [...flags.keys()].filter((flag) => !allowedSet.has(flag));
-  if (unknown.length > 0) {
-    throw new Error(`Unknown flag(s): ${unknown.map((flag) => `--${flag}`).join(", ")}`);
-  }
 };
 
 const getBooleanFlag = (flags: Map<string, string | boolean>, key: string): boolean => {
