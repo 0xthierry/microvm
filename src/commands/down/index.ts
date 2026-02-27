@@ -1,22 +1,17 @@
-import { Command } from "../../cli/command";
-import { assertVmIdMiddleware } from "../middlewares/vm-id";
-import { noFlagsSchema, positionalsSchema } from "../schemas";
-import type { CommandDeps } from "../types";
+import type { Command as CommanderCommand } from "commander";
+import { parseDownInput, type DownCommandParams } from "./input";
+import { handleDown } from "./handler";
 
-export const downCommand = (deps: CommandDeps) =>
-  new Command({
-    name: "down",
-    usage: "bun src/index.ts down [vm-id]",
-    summary: "Alias for stop",
-    schemas: {
-      positionals: positionalsSchema("down", 1),
-      flags: noFlagsSchema,
-    },
-    middlewares: [
-      assertVmIdMiddleware(deps.vmIdPolicy),
-    ],
-    execute: async ({ parsed }) => {
-      const vmId = deps.vmIdPolicy.normalizeVmId(parsed.positionals[0]);
-      await deps.vmLifecycle.runStop(vmId);
-    },
+export const registerDownCommand = (program: CommanderCommand): void => {
+  const command = program.command("down <idOrName>");
+  command.summary("Stop a VM and clear runtime state");
+  command.description("Stop a VM and tear down its runtime networking and process state.");
+  command.option("--json [value]", "Emit JSON output for scripting");
+  command.action(async (idOrName: string, options: Omit<DownCommandParams, "idOrName">) => {
+    const input = parseDownInput({
+      idOrName,
+      json: options.json,
+    });
+    await handleDown(input);
   });
+};

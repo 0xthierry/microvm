@@ -1,33 +1,42 @@
-import { z } from "zod";
+import { Option, type Command as CommanderCommand } from "commander";
+import { parsePositiveIntegerOption } from "../../cli/options";
+import { parseSetInput, type SetCommandParams } from "./input";
+import { handleSet } from "./handler";
 
-import { Command } from "../../cli/command";
-import { assertVmIdMiddleware } from "../middlewares/vm-id";
-import { parseSetOptions } from "./options";
-import { flagValueSchema, positionalsSchema } from "../schemas";
-import type { CommandDeps } from "../types";
-
-const setFlagsSchema = z.object({
-  cpus: flagValueSchema.optional(),
-  "memory-mib": flagValueSchema.optional(),
-  "disk-mib": flagValueSchema.optional(),
-  "disk-gib": flagValueSchema.optional(),
-  "ssh-user": flagValueSchema.optional(),
-}).strict();
-
-export const setCommand = (deps: CommandDeps) =>
-  new Command({
-    name: "set",
-    usage: "bun src/index.ts set [vm-id] [--cpus N] [--memory-mib N] [--disk-gib N|--disk-mib N] [--ssh-user USER]",
-    summary: "Update VM configuration",
-    schemas: {
-      positionals: positionalsSchema("set", 1),
-      flags: setFlagsSchema,
-    },
-    middlewares: [
-      assertVmIdMiddleware(deps.vmIdPolicy),
-    ],
-    execute: async ({ parsed }) => {
-      const vmId = deps.vmIdPolicy.normalizeVmId(parsed.positionals[0]);
-      await deps.vmLifecycle.runSet(vmId, parseSetOptions(parsed.flags, deps.appConfig));
-    },
+export const registerSetCommand = (program: CommanderCommand): void => {
+  const command = program.command("set <idOrName>");
+  command.summary("Update stored VM configuration");
+  command.description(
+    "Update stored VM configuration. CPU and memory changes apply on the next boot; disk growth requires the VM to be stopped.",
+  );
+  command.option("--cpus <count>", "vCPU count to store for the next boot", parsePositiveIntegerOption("cpus"));
+  command.option(
+    "--memory-mib <size>",
+    "Memory size in MiB to store for the next boot",
+    parsePositiveIntegerOption("memory-mib"),
+  );
+  command.addOption(
+    new Option("--disk-mib <size>", "Disk size in MiB (grow-only; requires a stopped VM)")
+      .argParser(parsePositiveIntegerOption("disk-mib"))
+      .conflicts("diskGib"),
+  );
+  command.addOption(
+    new Option("--disk-gib <size>", "Disk size in GiB (grow-only; requires a stopped VM)")
+      .argParser(parsePositiveIntegerOption("disk-gib"))
+      .conflicts("diskMib"),
+  );
+  command.option("--ssh-user <user>", "SSH user to store for future SSH commands");
+  command.option("--json [value]", "Emit JSON output for scripting");
+  command.action(async (idOrName: string, options: Omit<SetCommandParams, "idOrName">) => {
+    const input = parseSetInput({
+      idOrName,
+      ...(options.cpus === undefined ? {} : { cpus: options.cpus }),
+      ...(options.memoryMib === undefined ? {} : { memoryMib: options.memoryMib }),
+      ...(options.diskMib === undefined ? {} : { diskMib: options.diskMib }),
+      ...(options.diskGib === undefined ? {} : { diskGib: options.diskGib }),
+      ...(options.sshUser === undefined ? {} : { sshUser: options.sshUser }),
+      ...(options.json === undefined ? {} : { json: options.json }),
+    });
+    await handleSet(input);
   });
+};

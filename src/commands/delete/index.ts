@@ -1,22 +1,17 @@
-import { Command } from "../../cli/command";
-import { assertVmIdMiddleware } from "../middlewares/vm-id";
-import { noFlagsSchema, positionalsSchema } from "../schemas";
-import type { CommandDeps } from "../types";
+import type { Command as CommanderCommand } from "commander";
+import { parseDeleteInput, type DeleteCommandParams } from "./input";
+import { handleDelete } from "./handler";
 
-export const deleteCommand = (deps: CommandDeps) =>
-  new Command({
-    name: "delete",
-    usage: "bun src/index.ts delete [vm-id]",
-    summary: "Delete VM and disk",
-    schemas: {
-      positionals: positionalsSchema("delete", 1),
-      flags: noFlagsSchema,
-    },
-    middlewares: [
-      assertVmIdMiddleware(deps.vmIdPolicy),
-    ],
-    execute: async ({ parsed }) => {
-      const vmId = deps.vmIdPolicy.normalizeVmId(parsed.positionals[0]);
-      await deps.vmLifecycle.runDelete(vmId);
-    },
+export const registerDeleteCommand = (program: CommanderCommand): void => {
+  const command = program.command("delete <idOrName>");
+  command.summary("Delete a VM record and its files");
+  command.description("Delete a VM record and its on-disk artifacts. Running VMs are stopped first.");
+  command.option("--json [value]", "Emit JSON output for scripting");
+  command.action(async (idOrName: string, options: Omit<DeleteCommandParams, "idOrName">) => {
+    const input = parseDeleteInput({
+      idOrName,
+      json: options.json,
+    });
+    await handleDelete(input);
   });
+};

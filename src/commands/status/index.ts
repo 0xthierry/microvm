@@ -1,17 +1,17 @@
-import { Command } from "../../cli/command";
-import { noFlagsSchema, positionalsSchema } from "../schemas";
-import type { CommandDeps } from "../types";
+import type { Command as CommanderCommand } from "commander";
+import { parseStatusInput, type StatusCommandParams } from "./input";
+import { handleStatus } from "./handler";
 
-export const statusCommand = (deps: CommandDeps) =>
-  new Command({
-    name: "status",
-    usage: "bun src/index.ts status [vm-id]",
-    summary: "Print VM status",
-    schemas: {
-      positionals: positionalsSchema("status", 1),
-      flags: noFlagsSchema,
-    },
-    execute: async ({ parsed }) => {
-      await deps.vmLifecycle.runStatus(parsed.positionals[0]);
-    },
+export const registerStatusCommand = (program: CommanderCommand): void => {
+  const command = program.command("status <idOrName>");
+  command.summary("Show stored VM config and tracked runtime");
+  command.description("Show stored VM configuration and tracked runtime metadata.");
+  command.option("--json [value]", "Emit JSON output for scripting");
+  command.action(async (idOrName: string, options: Omit<StatusCommandParams, "idOrName">) => {
+    const input = parseStatusInput({
+      idOrName,
+      json: options.json,
+    });
+    await handleStatus(input);
   });
+};

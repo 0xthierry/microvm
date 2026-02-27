@@ -1,5 +1,41 @@
 {
+  "name": "microvm",
+  "version": "0.1.0",
+  "description": "Firecracker microVM orchestration CLI",
+  "license": "MIT",
+  "bin": {
+    "microvm": "src/index.ts"
+  },
+  "scripts": {
+    "prepare": "lefthook install",
+    "start": "bash ./scripts/start.sh",
+    "build:binary": "mkdir -p dist && bun build ./src/index.ts --compile --outfile dist/microvm",
+    "install:cli": "bash ./scripts/install-cli.sh",
+    "uninstall:cli": "bash ./scripts/uninstall-cli.sh",
+    "typecheck": "tsgo --noEmit --project tsconfig.json",
+    "lint": "oxlint src --config oxlint.config.mjs --deny-warnings",
+    "lint:fix": "oxlint src --config oxlint.config.mjs --fix --deny-warnings",
+    "format": "oxfmt --write src",
+    "format:fix": "oxfmt --write",
+    "format:check": "oxfmt --check src",
+    "test:unit": "bun test src/model src/services src/lib src/config src/cli",
+    "test:integration": "bun test src/commands",
+    "test": "bun test",
+    "check": "bun run typecheck && bun run lint && bun run test:unit && bun run test:integration"
+  },
   "dependencies": {
+    "cli-table3": "^0.6.5",
+    "commander": "^14.0.3",
+    "yoctocolors": "^2.1.2",
     "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@typescript/native-preview": "^7.0.0-dev.20260228.1",
+    "bun-types": "^1.3.10",
+    "eslint-plugin-boundaries": "^5.4.0",
+    "fast-check": "^4.5.3",
+    "lefthook": "^2.1.1",
+    "oxfmt": "^0.35.0",
+    "oxlint": "^1.50.0"
   }
 }

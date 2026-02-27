@@ -67,9 +67,31 @@ export const rlimitEnvSchema = z.object({
   ),
 });
 
+export const runtimeLocationEnvSchema = z.object({
+  MICROVM_HOME: optionalTrimmedString(
+    "Explicit microvm state directory override.",
+  ),
+  XDG_DATA_HOME: optionalTrimmedString(
+    "XDG data home used for persistent VM data (disks/keys).",
+  ),
+  XDG_STATE_HOME: optionalTrimmedString(
+    "XDG state home used for persistent runtime state when MICROVM_HOME is not set.",
+  ),
+  XDG_CACHE_HOME: optionalTrimmedString(
+    "XDG cache home used for rebuildable artifacts and temporary files.",
+  ),
+  XDG_RUNTIME_DIR: optionalTrimmedString(
+    "XDG runtime dir used for ephemeral runtime sockets/files.",
+  ),
+  HOME: optionalTrimmedString(
+    "Home directory fallback used to resolve XDG state location defaults.",
+  ),
+});
+
 export const envSchema = sudoIdentityEnvSchema
   .merge(cgroupEnvSchema)
-  .merge(rlimitEnvSchema);
+  .merge(rlimitEnvSchema)
+  .merge(runtimeLocationEnvSchema);
 
 export type Environment = z.infer<typeof envSchema>;
 

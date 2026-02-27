@@ -1,40 +1,40 @@
-import { z } from "zod";
+import { Option, type Command as CommanderCommand } from "commander";
+import { parsePositiveIntegerOption } from "../../cli/options";
+import { getAppConfig } from "../../config/runtime-context";
+import { parseCreateInput, type CreateCommandOptions } from "./input";
+import { handleCreate } from "./handler";
 
-import { Command } from "../../cli/command";
-import {
-  assertJailerSafeVmIdMiddleware,
-  assertJailerSocketPathLengthMiddleware,
-  assertVmIdMiddleware,
-} from "../middlewares/vm-id";
-import { parseCreateOptions } from "./options";
-import { flagValueSchema, positionalsSchema } from "../schemas";
-import type { CommandDeps } from "../types";
-
-const createFlagsSchema = z.object({
-  cpus: flagValueSchema.optional(),
-  "memory-mib": flagValueSchema.optional(),
-  "disk-mib": flagValueSchema.optional(),
-  "disk-gib": flagValueSchema.optional(),
-  dockerfile: flagValueSchema.optional(),
-  "ssh-user": flagValueSchema.optional(),
-}).strict();
-
-export const createCommand = (deps: CommandDeps) =>
-  new Command({
-    name: "create",
-    usage: "bun src/index.ts create [vm-id] [--cpus N] [--memory-mib N] [--disk-gib N|--disk-mib N] [--dockerfile PATH] [--ssh-user USER]",
-    summary: "Create a VM",
-    schemas: {
-      positionals: positionalsSchema("create", 1),
-      flags: createFlagsSchema,
-    },
-    middlewares: [
-      assertVmIdMiddleware(deps.vmIdPolicy),
-      assertJailerSafeVmIdMiddleware(deps.vmIdPolicy),
-      assertJailerSocketPathLengthMiddleware(deps.vmIdPolicy),
-    ],
-    execute: async ({ parsed }) => {
-      const vmId = deps.vmIdPolicy.normalizeVmId(parsed.positionals[0]);
-      await deps.vmLifecycle.runCreate(vmId, parseCreateOptions(parsed.flags, deps.appConfig));
-    },
+export const registerCreateCommand = (program: CommanderCommand): void => {
+  const defaults = getAppConfig().defaults.vm;
+  const command = program.command("create");
+  command.summary("Create a stopped VM record and rootfs");
+  command.description("Create a stopped VM record and rootfs from a Dockerfile. Does not boot the VM.");
+  command.requiredOption("--name <name>", "VM name");
+  command.option(
+    "--cpus <count>",
+    `vCPU count (default: ${defaults.vcpuCount})`,
+    parsePositiveIntegerOption("cpus"),
+  );
+  command.option(
+    "--memory-mib <size>",
+    `Memory size in MiB (default: ${defaults.memSizeMib})`,
+    parsePositiveIntegerOption("memory-mib"),
+  );
+  command.addOption(
+    new Option("--disk-mib <size>", `Disk size in MiB (default VM disk: ${defaults.diskSizeMib})`)
+      .argParser(parsePositiveIntegerOption("disk-mib"))
+      .conflicts("diskGib"),
+  );
+  command.addOption(
+    new Option("--disk-gib <size>", `Disk size in GiB (default VM disk: ${defaults.diskSizeMib / 1024})`)
+      .argParser(parsePositiveIntegerOption("disk-gib"))
+      .conflicts("diskMib"),
+  );
+  command.requiredOption("--dockerfile <path>", "Dockerfile path used to build the rootfs");
+  command.option("--ssh-user <user>", `Guest SSH user (default: ${defaults.sshUser})`);
+  command.option("--json [value]", "Emit JSON output for scripting");
+  command.action(async (options: CreateCommandOptions) => {
+    const input = parseCreateInput(options);
+    await handleCreate(input);
   });
+};

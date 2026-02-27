@@ -9,9 +9,7 @@ export type AppConfig = {
   env: Environment;
   paths: RuntimePaths;
   defaults: {
-    vm: typeof vmDefaults & {
-      dockerfilePath: string;
-    };
+    vm: typeof vmDefaults;
     network: typeof networkDefaults;
     jailer: typeof jailerDefaults;
     runtime: typeof runtimeDefaults;
@@ -25,16 +23,13 @@ export const buildAppConfig = ({
   projectRoot: string;
   env: Environment;
 }): AppConfig => {
-  const paths = buildRuntimePaths({ projectRoot });
+  const paths = buildRuntimePaths({ projectRoot, env });
 
   return {
     env,
     paths,
     defaults: {
-      vm: {
-        ...vmDefaults,
-        dockerfilePath: paths.defaultRootfsDockerfile,
-      },
+      vm: vmDefaults,
       network: networkDefaults,
       jailer: jailerDefaults,
       runtime: runtimeDefaults,
