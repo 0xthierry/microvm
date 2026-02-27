@@ -12,6 +12,6 @@ export const statusCommand = (deps: CommandDeps) =>
       flags: noFlagsSchema,
     },
     execute: async ({ parsed }) => {
-      await deps.runStatus(parsed.positionals[0]);
+      await deps.vmLifecycle.runStatus(parsed.positionals[0]);
     },
   });

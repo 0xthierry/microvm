@@ -7,6 +7,7 @@ import {
 } from "../middlewares/vm-id";
 import { flagValueSchema, positionalsSchema } from "../schemas";
 import type { CommandDeps } from "../types";
+import { parseStartOptions } from "./options";
 
 const startFlagsSchema = z.object({
   "no-attach": flagValueSchema.optional(),
@@ -28,12 +29,12 @@ export const startCommand = (deps: CommandDeps) =>
       flags: startFlagsSchema,
     },
     middlewares: [
-      assertVmIdMiddleware(deps.normalizeVmId, deps.assertVmId),
-      assertJailerSafeVmIdMiddleware(deps.normalizeVmId, deps.assertJailerSafeVmId),
+      assertVmIdMiddleware(deps.vmIdPolicy),
+      assertJailerSafeVmIdMiddleware(deps.vmIdPolicy),
     ],
     execute: async ({ parsed }) => {
-      const vmId = deps.normalizeVmId(parsed.positionals[0]);
-      const attach = !deps.getBooleanFlag(parsed.flags, "no-attach");
-      await deps.runStart(vmId, attach, false, deps.parseCreateOptions(parsed.flags));
+      const vmId = deps.vmIdPolicy.normalizeVmId(parsed.positionals[0]);
+      const options = parseStartOptions(parsed.flags, deps.appConfig);
+      await deps.vmLifecycle.runStart(vmId, options.attach, false, options.createOptions);
     },
   });

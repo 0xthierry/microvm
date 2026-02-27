@@ -1,25 +1,23 @@
 import type { CommandMiddleware } from "../../cli/command";
+import type { VmIdPolicyService } from "../../services/vm-id-policy";
 
 export const assertVmIdMiddleware = (
-  normalizeVmId: (value: string | undefined) => string,
-  assertVmId: (vmId: string) => void,
+  vmIdPolicy: VmIdPolicyService,
 ): CommandMiddleware => ({ parsed }) => {
-  const vmId = normalizeVmId(parsed.positionals[0]);
-  assertVmId(vmId);
+  const vmId = vmIdPolicy.normalizeVmId(parsed.positionals[0]);
+  vmIdPolicy.assertVmId(vmId);
 };
 
 export const assertJailerSafeVmIdMiddleware = (
-  normalizeVmId: (value: string | undefined) => string,
-  assertJailerSafeVmId: (vmId: string) => void,
+  vmIdPolicy: VmIdPolicyService,
 ): CommandMiddleware => ({ parsed }) => {
-  const vmId = normalizeVmId(parsed.positionals[0]);
-  assertJailerSafeVmId(vmId);
+  const vmId = vmIdPolicy.normalizeVmId(parsed.positionals[0]);
+  vmIdPolicy.assertJailerSafeVmId(vmId);
 };
 
 export const assertJailerSocketPathLengthMiddleware = (
-  normalizeVmId: (value: string | undefined) => string,
-  assertJailerSocketPathLength: (vmId: string) => void,
+  vmIdPolicy: VmIdPolicyService,
 ): CommandMiddleware => ({ parsed }) => {
-  const vmId = normalizeVmId(parsed.positionals[0]);
-  assertJailerSocketPathLength(vmId);
+  const vmId = vmIdPolicy.normalizeVmId(parsed.positionals[0]);
+  vmIdPolicy.assertJailerSocketPathLength(vmId);
 };

@@ -13,10 +13,10 @@ export const sshCommand = (deps: CommandDeps) =>
       flags: noFlagsSchema,
     },
     middlewares: [
-      assertVmIdMiddleware(deps.normalizeVmId, deps.assertVmId),
+      assertVmIdMiddleware(deps.vmIdPolicy),
     ],
     execute: async ({ parsed }) => {
-      const vmId = deps.normalizeVmId(parsed.positionals[0]);
-      await deps.runSsh(vmId);
+      const vmId = deps.vmIdPolicy.normalizeVmId(parsed.positionals[0]);
+      await deps.vmLifecycle.runSsh(vmId);
     },
   });

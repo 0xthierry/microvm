@@ -1,0 +1,7 @@
+export const vmDefaults = {
+  id: "vm0",
+  sshUser: "root",
+  vcpuCount: 2,
+  memSizeMib: 1024,
+  diskSizeMib: 10 * 1024,
+} as const;

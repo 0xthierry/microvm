@@ -6,6 +6,7 @@ import {
   assertJailerSocketPathLengthMiddleware,
   assertVmIdMiddleware,
 } from "../middlewares/vm-id";
+import { parseCreateOptions } from "./options";
 import { flagValueSchema, positionalsSchema } from "../schemas";
 import type { CommandDeps } from "../types";
 
@@ -28,12 +29,12 @@ export const createCommand = (deps: CommandDeps) =>
       flags: createFlagsSchema,
     },
     middlewares: [
-      assertVmIdMiddleware(deps.normalizeVmId, deps.assertVmId),
-      assertJailerSafeVmIdMiddleware(deps.normalizeVmId, deps.assertJailerSafeVmId),
-      assertJailerSocketPathLengthMiddleware(deps.normalizeVmId, deps.assertJailerSocketPathLength),
+      assertVmIdMiddleware(deps.vmIdPolicy),
+      assertJailerSafeVmIdMiddleware(deps.vmIdPolicy),
+      assertJailerSocketPathLengthMiddleware(deps.vmIdPolicy),
     ],
     execute: async ({ parsed }) => {
-      const vmId = deps.normalizeVmId(parsed.positionals[0]);
-      await deps.runCreate(vmId, deps.parseCreateOptions(parsed.flags));
+      const vmId = deps.vmIdPolicy.normalizeVmId(parsed.positionals[0]);
+      await deps.vmLifecycle.runCreate(vmId, parseCreateOptions(parsed.flags, deps.appConfig));
     },
   });

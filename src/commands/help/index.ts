@@ -13,6 +13,6 @@ export const helpCommand = (deps: CommandDeps) =>
       flags: noFlagsSchema,
     },
     execute: async () => {
-      console.log(deps.renderHelp());
+      console.log(deps.helpRenderer.renderHelp());
     },
   });

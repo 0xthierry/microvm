@@ -13,10 +13,10 @@ export const deleteCommand = (deps: CommandDeps) =>
       flags: noFlagsSchema,
     },
     middlewares: [
-      assertVmIdMiddleware(deps.normalizeVmId, deps.assertVmId),
+      assertVmIdMiddleware(deps.vmIdPolicy),
     ],
     execute: async ({ parsed }) => {
-      const vmId = deps.normalizeVmId(parsed.positionals[0]);
-      await deps.runDelete(vmId);
+      const vmId = deps.vmIdPolicy.normalizeVmId(parsed.positionals[0]);
+      await deps.vmLifecycle.runDelete(vmId);
     },
   });

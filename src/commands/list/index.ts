@@ -12,6 +12,6 @@ export const listCommand = (deps: CommandDeps) =>
       flags: noFlagsSchema,
     },
     execute: async () => {
-      await deps.runList();
+      await deps.vmLifecycle.runList();
     },
   });

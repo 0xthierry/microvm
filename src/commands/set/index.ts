@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { Command } from "../../cli/command";
 import { assertVmIdMiddleware } from "../middlewares/vm-id";
+import { parseSetOptions } from "./options";
 import { flagValueSchema, positionalsSchema } from "../schemas";
 import type { CommandDeps } from "../types";
 
@@ -23,10 +24,10 @@ export const setCommand = (deps: CommandDeps) =>
       flags: setFlagsSchema,
     },
     middlewares: [
-      assertVmIdMiddleware(deps.normalizeVmId, deps.assertVmId),
+      assertVmIdMiddleware(deps.vmIdPolicy),
     ],
     execute: async ({ parsed }) => {
-      const vmId = deps.normalizeVmId(parsed.positionals[0]);
-      await deps.runSet(vmId, deps.parseSetOptions(parsed.flags));
+      const vmId = deps.vmIdPolicy.normalizeVmId(parsed.positionals[0]);
+      await deps.vmLifecycle.runSet(vmId, parseSetOptions(parsed.flags, deps.appConfig));
     },
   });
