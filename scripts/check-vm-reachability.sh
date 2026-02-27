@@ -2,9 +2,34 @@
 
 set -euo pipefail
 
-VM_A="${1:-vm1}"
-VM_B="${2:-vm2}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RAW_VM_A="${1:-vma_${RANDOM}_$(date +%s | tail -c 4)}"
+RAW_VM_B="${2:-vmb_${RANDOM}_$(date +%s | tail -c 4)}"
+KEEP_VM_ON_EXIT="${KEEP_VM_ON_EXIT:-0}"
+CREATED_A="0"
+CREATED_B="0"
+
+normalize_vm_id() {
+  local raw="$1"
+  local normalized
+  normalized="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_' '_')"
+  normalized="${normalized#_}"
+  normalized="${normalized%_}"
+  if [[ -z "$normalized" ]]; then
+    normalized="vm"
+  fi
+  if [[ ! "$normalized" =~ ^[a-z0-9] ]]; then
+    normalized="vm_${normalized}"
+  fi
+  if (( ${#normalized} > 15 )); then
+    normalized="${normalized:0:15}"
+  fi
+  if [[ -z "$normalized" ]]; then
+    print_fail "invalid vm id: $raw"
+    exit 1
+  fi
+  printf '%s' "$normalized"
+}
 
 require_cmd() {
   if command -v "$1" >/dev/null 2>&1; then
@@ -14,27 +39,15 @@ require_cmd() {
   exit 2
 }
 
-require_cmd bun
-require_cmd ssh
-require_cmd timeout
-
-read_vm_meta() {
-  local vm_id="$1"
+run_cli() {
   (
     cd "$PROJECT_ROOT"
-    bun src/index.ts status "$vm_id" \
-      | bun -e '
-          const fs = require("node:fs");
-          const state = JSON.parse(fs.readFileSync(0, "utf8"));
-          if (!state.vm) {
-            process.exit(3);
-          }
-          const vm = state.vm;
-          const pid = vm.runtime?.firecrackerPid ?? "";
-          const running = state.running ? "1" : "0";
-          console.log([vm.vmId, vm.guestIp, vm.sshKeyPath, vm.sshUser, running, String(pid)].join("\t"));
-        '
+    bun src/index.ts "$@"
   )
+}
+
+print_step() {
+  echo "[check] $1"
 }
 
 print_pass() {
@@ -45,12 +58,84 @@ print_fail() {
   echo "[FAIL] $1" >&2
 }
 
-if ! A_META="$(read_vm_meta "$VM_A")"; then
+cleanup() {
+  if [[ "$KEEP_VM_ON_EXIT" == "1" ]]; then
+    return
+  fi
+  if [[ "$CREATED_A" == "1" ]]; then
+    run_cli delete "$VM_A" >/dev/null 2>&1 || true
+  fi
+  if [[ "$CREATED_B" == "1" ]]; then
+    run_cli delete "$VM_B" >/dev/null 2>&1 || true
+  fi
+}
+
+trap cleanup EXIT
+
+read_vm_meta() {
+  local vm_id="$1"
+  local status
+  status="$(run_cli status "$vm_id")"
+  printf '%s' "$status" | bun -e '
+    const fs = require("node:fs");
+    const state = JSON.parse(fs.readFileSync(0, "utf8"));
+    if (!state.vm) {
+      process.exit(3);
+    }
+    const vm = state.vm;
+    const pid = vm.runtime?.firecrackerPid ?? "";
+    const running = state.running ? "1" : "0";
+    console.log([vm.vmId, vm.guestIp, vm.sshKeyPath, vm.sshUser, running, String(pid)].join("\t"));
+  '
+}
+
+require_cmd bun
+require_cmd ssh
+require_cmd timeout
+
+VM_A="$(normalize_vm_id "$RAW_VM_A")"
+VM_B="$(normalize_vm_id "$RAW_VM_B")"
+
+if [[ "$RAW_VM_A" != "$VM_A" ]]; then
+  print_step "normalized VM A id: $RAW_VM_A -> $VM_A"
+fi
+if [[ "$RAW_VM_B" != "$VM_B" ]]; then
+  print_step "normalized VM B id: $RAW_VM_B -> $VM_B"
+fi
+
+if [[ "$VM_A" == "$VM_B" ]]; then
+  print_fail "VM A and VM B must be different: $VM_A"
+  exit 1
+fi
+
+if run_cli status "$VM_A" >/dev/null 2>&1; then
+  print_fail "VM already exists: $VM_A. Use a different ID."
+  exit 1
+fi
+
+if run_cli status "$VM_B" >/dev/null 2>&1; then
+  print_fail "VM already exists: $VM_B. Use a different ID."
+  exit 1
+fi
+
+print_step "create and start VM A: $VM_A"
+run_cli create "$VM_A"
+CREATED_A="1"
+run_cli start "$VM_A" --no-attach
+A_META="$(read_vm_meta "$VM_A")"
+
+print_step "create and start VM B: $VM_B"
+run_cli create "$VM_B"
+CREATED_B="1"
+run_cli start "$VM_B" --no-attach
+B_META="$(read_vm_meta "$VM_B")"
+
+if [[ -z "$A_META" ]]; then
   print_fail "could not read status for $VM_A"
   exit 1
 fi
 
-if ! B_META="$(read_vm_meta "$VM_B")"; then
+if [[ -z "$B_META" ]]; then
   print_fail "could not read status for $VM_B"
   exit 1
 fi
@@ -101,4 +186,4 @@ else
   print_pass "$B_ID -> $A_ID:22 blocked"
 fi
 
-echo "[check] isolation test passed for $A_ID and $B_ID"
+print_pass "isolation test passed for $A_ID and $B_ID"

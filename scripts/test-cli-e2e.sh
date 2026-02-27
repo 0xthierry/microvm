@@ -57,6 +57,7 @@ VM_RUNNING=""
 VM_IP=""
 VM_USER=""
 VM_KEY=""
+VM_HOME=""
 
 load_status() {
   STATUS_JSON="$(run_cli status "$VM_ID")"
@@ -109,7 +110,12 @@ else
 fi
 
 print_step "write persistent marker inside VM"
-PERSIST_PATH="/home/$VM_USER/.microvm-e2e-persist.txt"
+VM_HOME="$(ssh_vm "getent passwd '$VM_USER' | cut -d: -f6")"
+if [[ -z "$VM_HOME" ]]; then
+  print_fail "failed resolving home directory for user $VM_USER"
+  exit 1
+fi
+PERSIST_PATH="$VM_HOME/.microvm-e2e-persist.txt"
 if ssh_vm "printf '%s\n' '$PERSIST_MARKER' > '$PERSIST_PATH' && sync"; then
   print_pass "marker written to $PERSIST_PATH"
 else

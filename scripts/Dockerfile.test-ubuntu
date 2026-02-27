@@ -1,0 +1,54 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      systemd \
+      systemd-sysv \
+      openssh-server \
+      iproute2 \
+      iputils-ping \
+      procps \
+      ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m -s /bin/bash thierry && \
+    echo 'root:root' | chpasswd && \
+    echo 'thierry:thierry' | chpasswd
+
+RUN mkdir -p /root/.ssh /home/thierry/.ssh && \
+    chmod 700 /root/.ssh /home/thierry/.ssh && \
+    chown -R thierry:thierry /home/thierry/.ssh
+
+RUN mkdir -p /etc/ssh/sshd_config.d && \
+    printf '%s\n' \
+      'PermitRootLogin yes' \
+      'PasswordAuthentication no' \
+      'KbdInteractiveAuthentication no' \
+      'ChallengeResponseAuthentication no' \
+      'UsePAM yes' \
+      'PubkeyAuthentication yes' \
+      'AuthenticationMethods publickey' \
+      > /etc/ssh/sshd_config.d/zz-firecracker.conf
+
+RUN ssh-keygen -A
+
+RUN mkdir -p /etc/systemd/system/multi-user.target.wants && \
+    ln -sf /lib/systemd/system/ssh.service /etc/systemd/system/multi-user.target.wants/ssh.service && \
+    ln -sf /lib/systemd/system/systemd-networkd.service /etc/systemd/system/multi-user.target.wants/systemd-networkd.service && \
+    ln -sf /lib/systemd/system/serial-getty@.service /etc/systemd/system/multi-user.target.wants/serial-getty@ttyS0.service
+
+RUN mkdir -p /etc/systemd/network && \
+    printf '%s\n' \
+      '[Match]' \
+      'Name=eth0' \
+      '' \
+      '[Network]' \
+      'KeepConfiguration=yes' \
+      'DNS=1.1.1.1' \
+      'DNS=8.8.8.8' \
+      > /etc/systemd/network/20-eth0.network
+
+RUN echo ubuntu-fc-vm > /etc/hostname && \
+    truncate -s 0 /etc/machine-id

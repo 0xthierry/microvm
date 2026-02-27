@@ -7,6 +7,7 @@ import {
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { createHash } from "node:crypto";
@@ -30,6 +31,10 @@ type VmConfig = {
   apiSocketPath: string;
   logPath: string;
   sshUser: string;
+  vcpuCount: number;
+  memSizeMib: number;
+  diskSizeMib: number;
+  dockerfilePath: string;
 };
 
 type KernelArtifact = {
@@ -55,8 +60,10 @@ type SshKeyPair = {
 
 type RootfsBuildMeta = {
   formatVersion: number;
+  dockerfilePath: string;
   dockerfileSha256: string;
   sshPubKeySha256: string;
+  sshUser: string;
   source: string;
   builtAt: string;
 };
@@ -112,20 +119,41 @@ type SshTarget = {
   guestIp: string;
 };
 
+type ParsedArgs = {
+  positionals: string[];
+  flags: Map<string, string | boolean>;
+};
+
+type CreateVmOptions = {
+  vcpuCount: number;
+  memSizeMib: number;
+  diskSizeMib: number;
+  dockerfilePath: string;
+  sshUser: string;
+};
+
+type SetVmOptions = {
+  vcpuCount?: number;
+  memSizeMib?: number;
+  diskSizeMib?: number;
+  sshUser?: string;
+};
+
 const PROJECT_ROOT = process.cwd();
 const WORK_DIR = resolve(PROJECT_ROOT, ".microvm");
 const ARTIFACTS_DIR = join(WORK_DIR, "artifacts");
 const RUNTIME_DIR = join(WORK_DIR, "runtime");
 const VMS_DIR = join(WORK_DIR, "vms");
 const VM_DB_FILE = join(RUNTIME_DIR, "vms.json");
-const ARCH_ROOTFS_DOCKERFILE = resolve(PROJECT_ROOT, "Dockerfile.arch");
-const ARCH_ROOTFS_EXT4 = resolve(ARTIFACTS_DIR, "rootfs", "archlinux.ext4");
-const ARCH_ROOTFS_META = resolve(ARTIFACTS_DIR, "rootfs", "archlinux.ext4.meta.json");
+const DEFAULT_ROOTFS_DOCKERFILE = resolve(PROJECT_ROOT, "Dockerfile.arch");
 const ROOTFS_TMP_DIR = resolve(WORK_DIR, "tmp");
 const ROOTFS_BUILD_FORMAT_VERSION = 2;
 const VM_DB_FORMAT_VERSION = 1;
 const DEFAULT_VM_ID = "vm0";
-const DEFAULT_VM_SSH_USER = "thierry";
+const DEFAULT_VM_SSH_USER = "root";
+const DEFAULT_VM_VCPU_COUNT = 2;
+const DEFAULT_VM_MEM_SIZE_MIB = 1024;
+const DEFAULT_VM_DISK_SIZE_MIB = 10 * 1024;
 const HOST_ALLOWED_TCP_PORT = "11434";
 const JAILER_BASE_DIR = resolve(WORK_DIR, "jailer");
 const JAILER_API_SOCKET_IN_JAIL = "/firecracker.socket";
@@ -143,19 +171,21 @@ const MAX_UNIX_SOCKET_PATH_LENGTH = 107;
 
 const HELP = `
 Usage:
-  bun src/index.ts create [vm-id]
+  bun src/index.ts create [vm-id] [--cpus N] [--memory-mib N] [--disk-gib N|--disk-mib N] [--dockerfile PATH] [--ssh-user USER]
   bun src/index.ts start [vm-id] [--no-attach]
+  bun src/index.ts set [vm-id] [--cpus N] [--memory-mib N] [--disk-gib N|--disk-mib N] [--ssh-user USER]
   bun src/index.ts stop [vm-id]
   bun src/index.ts delete [vm-id]
   bun src/index.ts ssh [vm-id]
   bun src/index.ts status [vm-id]
   bun src/index.ts list
-  bun src/index.ts up [vm-id] [--no-attach]   # alias for start
+  bun src/index.ts up [vm-id] [--no-attach] [create flags...]   # alias for start with auto-create
   bun src/index.ts down [vm-id]                # alias for stop
 
 Notes:
   - default vm-id is "${DEFAULT_VM_ID}" when omitted
-  - create builds/reuses base Arch rootfs and clones per-VM ext4
+  - defaults: ${DEFAULT_VM_VCPU_COUNT} CPU, ${DEFAULT_VM_MEM_SIZE_MIB} MiB RAM, ${DEFAULT_VM_DISK_SIZE_MIB / 1024} GiB disk, Dockerfile.arch, ssh-user=${DEFAULT_VM_SSH_USER}
+  - create builds/reuses a cached Dockerfile-based ext4 and clones per-VM ext4
   - each VM has isolated disk (.microvm/vms/<vm-id>/rootfs.ext4)
   - VM registry persists in .microvm/runtime/vms.json
 `.trim();
@@ -164,52 +194,105 @@ const decoder = new TextDecoder();
 
 const main = async (): Promise<void> => {
   const rawArgs = process.argv.slice(2);
-  const attach = !rawArgs.includes("--no-attach");
-  const positionalArgs = rawArgs.filter((arg) => arg !== "--no-attach");
-  const command = positionalArgs[0] ?? "up";
-  const vmId = normalizeVmId(positionalArgs[1]);
+  const command = rawArgs[0] ?? "up";
+  const parsed = parseArgs(rawArgs.slice(1));
+  const vmId = normalizeVmId(parsed.positionals[0]);
 
   if (command === "create") {
-    await runCreate(vmId);
+    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
+    assertAllowedFlags(parsed.flags, [
+      "cpus",
+      "memory-mib",
+      "disk-mib",
+      "disk-gib",
+      "dockerfile",
+      "ssh-user",
+    ]);
+    await runCreate(vmId, parseCreateOptions(parsed.flags));
     return;
   }
 
   if (command === "start") {
-    await runStart(vmId, attach, false);
+    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
+    assertAllowedFlags(parsed.flags, [
+      "no-attach",
+      "cpus",
+      "memory-mib",
+      "disk-mib",
+      "disk-gib",
+      "dockerfile",
+      "ssh-user",
+    ]);
+    await runStart(vmId, !getBooleanFlag(parsed.flags, "no-attach"), false, parseCreateOptions(parsed.flags));
     return;
   }
 
   if (command === "up") {
-    await runStart(vmId, attach, true);
+    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
+    assertAllowedFlags(parsed.flags, [
+      "no-attach",
+      "cpus",
+      "memory-mib",
+      "disk-mib",
+      "disk-gib",
+      "dockerfile",
+      "ssh-user",
+    ]);
+    await runStart(vmId, !getBooleanFlag(parsed.flags, "no-attach"), true, parseCreateOptions(parsed.flags));
     return;
   }
 
   if (command === "stop") {
+    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
+    assertAllowedFlags(parsed.flags, []);
     await runStop(vmId);
     return;
   }
 
+  if (command === "set") {
+    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
+    assertAllowedFlags(parsed.flags, [
+      "cpus",
+      "memory-mib",
+      "disk-mib",
+      "disk-gib",
+      "ssh-user",
+    ]);
+    await runSet(vmId, parseSetOptions(parsed.flags));
+    return;
+  }
+
   if (command === "delete") {
+    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
+    assertAllowedFlags(parsed.flags, []);
     await runDelete(vmId);
     return;
   }
 
   if (command === "down") {
+    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
+    assertAllowedFlags(parsed.flags, []);
     await runStop(vmId);
     return;
   }
 
   if (command === "ssh") {
+    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
+    assertAllowedFlags(parsed.flags, []);
     await runSsh(vmId);
     return;
   }
 
   if (command === "status") {
-    await runStatus(positionalArgs[1]);
+    assertNoUnexpectedPositionals(command, parsed.positionals, 1);
+    assertAllowedFlags(parsed.flags, []);
+    await runStatus(parsed.positionals[0]);
     return;
   }
 
   if (command === "list") {
+    assertNoUnexpectedPositionals(command, parsed.positionals, 0);
+    assertAllowedFlags(parsed.flags, []);
     await runList();
     return;
   }
@@ -222,12 +305,167 @@ const main = async (): Promise<void> => {
   throw new Error(`Unknown command "${command}".\n\n${HELP}`);
 };
 
-const runCreate = async (vmId: string): Promise<void> => {
+const parseArgs = (args: string[]): ParsedArgs => {
+  const positionals: string[] = [];
+  const flags = new Map<string, string | boolean>();
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (!token.startsWith("--")) {
+      positionals.push(token);
+      continue;
+    }
+
+    const eq = token.indexOf("=");
+    const key = eq >= 0 ? token.slice(2, eq) : token.slice(2);
+    if (!key) {
+      throw new Error(`Invalid flag syntax: ${token}`);
+    }
+    if (flags.has(key)) {
+      throw new Error(`Flag provided more than once: --${key}`);
+    }
+
+    if (eq >= 0) {
+      flags.set(key, token.slice(eq + 1));
+      continue;
+    }
+    const next = args[index + 1];
+    if (next && !next.startsWith("--")) {
+      flags.set(key, next);
+      index += 1;
+      continue;
+    }
+    flags.set(key, true);
+  }
+
+  return { positionals, flags };
+};
+
+const assertNoUnexpectedPositionals = (command: string, positionals: string[], maxCount: number): void => {
+  if (positionals.length <= maxCount) return;
+  throw new Error(
+    `Too many positional arguments for "${command}". Received: ${positionals.join(" ")}`,
+  );
+};
+
+const assertAllowedFlags = (flags: Map<string, string | boolean>, allowed: string[]): void => {
+  const allowedSet = new Set(allowed);
+  const unknown = [...flags.keys()].filter((flag) => !allowedSet.has(flag));
+  if (unknown.length > 0) {
+    throw new Error(`Unknown flag(s): ${unknown.map((flag) => `--${flag}`).join(", ")}`);
+  }
+};
+
+const getBooleanFlag = (flags: Map<string, string | boolean>, key: string): boolean => {
+  const value = flags.get(key);
+  if (value === undefined) return false;
+  if (value === true) return true;
+
+  const normalized = value.toLowerCase();
+  if (normalized === "1" || normalized === "true" || normalized === "yes") return true;
+  if (normalized === "0" || normalized === "false" || normalized === "no") return false;
+  throw new Error(`Flag --${key} expects a boolean value (true/false), got "${value}".`);
+};
+
+const getStringFlag = (flags: Map<string, string | boolean>, key: string): string | undefined => {
+  const value = flags.get(key);
+  if (value === undefined) return undefined;
+  if (value === true) {
+    throw new Error(`Flag --${key} expects a value.`);
+  }
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(`Flag --${key} cannot be empty.`);
+  }
+  return trimmed;
+};
+
+const parsePositiveInt = (raw: string, flagName: string): number => {
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`Flag --${flagName} expects a positive integer, got "${raw}".`);
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`Flag --${flagName} expects a positive integer, got "${raw}".`);
+  }
+  return value;
+};
+
+const parseDiskSizeMib = (flags: Map<string, string | boolean>, fallbackMib: number): number => {
+  const diskMib = getStringFlag(flags, "disk-mib");
+  const diskGib = getStringFlag(flags, "disk-gib");
+  if (diskMib && diskGib) {
+    throw new Error("Use either --disk-mib or --disk-gib, not both.");
+  }
+  if (diskMib) return parsePositiveInt(diskMib, "disk-mib");
+  if (diskGib) return parsePositiveInt(diskGib, "disk-gib") * 1024;
+  return fallbackMib;
+};
+
+const parseSshUser = (raw: string): string => {
+  if (/^[a-z_][a-z0-9_-]{0,31}$/.test(raw)) {
+    return raw;
+  }
+  throw new Error(
+    `Invalid ssh user "${raw}". Use lowercase letters, digits, '_' and '-' (max 32 chars).`,
+  );
+};
+
+const defaultCreateOptions = (): CreateVmOptions => ({
+  vcpuCount: DEFAULT_VM_VCPU_COUNT,
+  memSizeMib: DEFAULT_VM_MEM_SIZE_MIB,
+  diskSizeMib: DEFAULT_VM_DISK_SIZE_MIB,
+  dockerfilePath: DEFAULT_ROOTFS_DOCKERFILE,
+  sshUser: DEFAULT_VM_SSH_USER,
+});
+
+const parseCreateOptions = (flags: Map<string, string | boolean>): CreateVmOptions => {
+  const defaults = defaultCreateOptions();
+  const cpus = getStringFlag(flags, "cpus");
+  const memoryMib = getStringFlag(flags, "memory-mib");
+  const dockerfile = getStringFlag(flags, "dockerfile");
+  const sshUser = getStringFlag(flags, "ssh-user");
+
+  return {
+    vcpuCount: cpus ? parsePositiveInt(cpus, "cpus") : defaults.vcpuCount,
+    memSizeMib: memoryMib ? parsePositiveInt(memoryMib, "memory-mib") : defaults.memSizeMib,
+    diskSizeMib: parseDiskSizeMib(flags, defaults.diskSizeMib),
+    dockerfilePath: resolve(PROJECT_ROOT, dockerfile ?? defaults.dockerfilePath),
+    sshUser: parseSshUser(sshUser ?? defaults.sshUser),
+  };
+};
+
+const parseSetOptions = (flags: Map<string, string | boolean>): SetVmOptions => {
+  const cpus = getStringFlag(flags, "cpus");
+  const memoryMib = getStringFlag(flags, "memory-mib");
+  const sshUser = getStringFlag(flags, "ssh-user");
+  const hasDiskFlag = flags.has("disk-mib") || flags.has("disk-gib");
+  const options: SetVmOptions = {};
+
+  if (cpus) {
+    options.vcpuCount = parsePositiveInt(cpus, "cpus");
+  }
+  if (memoryMib) {
+    options.memSizeMib = parsePositiveInt(memoryMib, "memory-mib");
+  }
+  if (hasDiskFlag) {
+    options.diskSizeMib = parseDiskSizeMib(flags, DEFAULT_VM_DISK_SIZE_MIB);
+  }
+  if (sshUser) {
+    options.sshUser = parseSshUser(sshUser);
+  }
+  if (Object.keys(options).length === 0) {
+    throw new Error("No changes requested. Pass at least one of --cpus, --memory-mib, --disk-gib/--disk-mib, --ssh-user.");
+  }
+  return options;
+};
+
+const runCreate = async (vmId: string, options: CreateVmOptions): Promise<void> => {
   assertVmId(vmId);
   assertJailerSafeVmId(vmId);
   assertJailerSocketPathLength(vmId);
   ensureDirs([WORK_DIR, ARTIFACTS_DIR, RUNTIME_DIR, VMS_DIR]);
-  ensureDependencies(["docker", "mkfs.ext4", "tar", "ssh-keygen", "sudo"]);
+  ensureDependencies(["docker", "mkfs.ext4", "tar", "ssh-keygen", "sudo", "e2fsck", "resize2fs"]);
   await ensureSudoSession();
 
   const db = readVmDatabase();
@@ -236,17 +474,17 @@ const runCreate = async (vmId: string): Promise<void> => {
   }
 
   const sshKeyPair = ensureSshKeyPair(SHARED_SSH_PRIVATE_KEY_PATH);
-  const rootfs = await ensureArchRootfsFromDocker({
-    dockerfilePath: ARCH_ROOTFS_DOCKERFILE,
-    ext4Path: ARCH_ROOTFS_EXT4,
-    metaPath: ARCH_ROOTFS_META,
+  const rootfs = await ensureRootfsFromDocker({
+    dockerfilePath: options.dockerfilePath,
     sshPublicKeyPath: sshKeyPair.publicKeyPath,
+    sshUser: options.sshUser,
   });
 
   const index = reserveVmIndex(db);
-  const config = buildVmConfig(vmId, index);
+  const config = buildVmConfig(vmId, index, options);
   const vmRootfsPath = join(vmDataDir(vmId), "rootfs.ext4");
   cloneExt4Rootfs(rootfs.ext4Path, vmRootfsPath);
+  growExt4DiskIfNeeded(vmRootfsPath, options.diskSizeMib);
   chmodSync(sshKeyPair.privateKeyPath, 0o600);
 
   const record: VmRecord = {
@@ -261,14 +499,22 @@ const runCreate = async (vmId: string): Promise<void> => {
   };
   db.vms[vmId] = record;
   writeVmDatabase(db);
-  logStep(`created VM "${vmId}" with isolated disk: ${vmRootfsPath}`);
+  logStep(
+    `created VM "${vmId}" with cpus=${options.vcpuCount}, memory=${options.memSizeMib} MiB, disk=${options.diskSizeMib} MiB, ssh-user=${options.sshUser}`,
+  );
+  logStep(`VM "${vmId}" isolated disk: ${vmRootfsPath}`);
 };
 
-const runStart = async (vmId: string, attach: boolean, autoCreate: boolean): Promise<void> => {
+const runStart = async (
+  vmId: string,
+  attach: boolean,
+  autoCreate: boolean,
+  createOptions: CreateVmOptions,
+): Promise<void> => {
   assertVmId(vmId);
   assertJailerSafeVmId(vmId);
   ensureDirs([WORK_DIR, ARTIFACTS_DIR, RUNTIME_DIR, VMS_DIR]);
-  ensureDependencies(["firecracker", "jailer", "curl", "ip", "iptables", "ssh", "ssh-keygen", "sudo", "docker", "mkfs.ext4", "tar"]);
+  ensureDependencies(["firecracker", "jailer", "curl", "ip", "iptables", "ssh", "ssh-keygen", "sudo", "docker", "mkfs.ext4", "tar", "e2fsck", "resize2fs"]);
   ensureKvmAccess();
   await ensureSudoSession();
 
@@ -279,7 +525,7 @@ const runStart = async (vmId: string, attach: boolean, autoCreate: boolean): Pro
       throw new Error(`VM "${vmId}" does not exist. Run "bun src/index.ts create ${vmId}" first.`);
     }
     logStep(`VM "${vmId}" not found, creating it now...`);
-    await runCreate(vmId);
+    await runCreate(vmId, createOptions);
     db = readVmDatabase();
     vm = db.vms[vmId];
   }
@@ -316,7 +562,7 @@ const runStart = async (vmId: string, attach: boolean, autoCreate: boolean): Pro
   const firecrackerBinaryPath = resolveBinaryPath("firecracker");
   assertJailerSocketPathLength(vmId, basename(firecrackerBinaryPath));
   const jailerBinaryPath = resolveBinaryPath("jailer");
-  const jailerProfile = resolveJailerProfile();
+  const jailerProfile = resolveJailerProfile(vm.diskSizeMib * 1024 * 1024);
   const vmUid = String(getRuntimeUid());
   const vmGid = String(getRuntimeGid());
   const jailerLayout = prepareJailerLayout({
@@ -432,6 +678,54 @@ const runStop = async (vmId: string): Promise<void> => {
   logStep(`VM "${vmId}" stopped and host network cleaned up.`);
 };
 
+const runSet = async (vmId: string, options: SetVmOptions): Promise<void> => {
+  assertVmId(vmId);
+  const db = readVmDatabase();
+  const vm = db.vms[vmId];
+  if (!vm) {
+    throw new Error(`VM "${vmId}" does not exist.`);
+  }
+
+  const running = Boolean(vm.runtime && isProcessAlive(vm.runtime.firecrackerPid));
+  const nextVcpu = options.vcpuCount ?? vm.vcpuCount;
+  const nextMem = options.memSizeMib ?? vm.memSizeMib;
+  const nextDisk = options.diskSizeMib ?? vm.diskSizeMib;
+  const nextSshUser = options.sshUser ?? vm.sshUser;
+
+  if (nextDisk < vm.diskSizeMib) {
+    throw new Error(
+      `Disk shrink is not supported (current ${vm.diskSizeMib} MiB, requested ${nextDisk} MiB).`,
+    );
+  }
+  if (nextDisk > vm.diskSizeMib && running) {
+    throw new Error(`VM "${vmId}" is running. Stop it before growing disk.`);
+  }
+  if (options.sshUser && options.sshUser !== vm.sshUser) {
+    logStep(
+      `updated ssh user to "${options.sshUser}". Ensure this user has your public key in authorized_keys inside the VM disk.`,
+    );
+  }
+
+  if (nextDisk > vm.diskSizeMib) {
+    ensureDependencies(["sudo", "e2fsck", "resize2fs"]);
+    await ensureSudoSession();
+    growExt4DiskIfNeeded(vm.rootfsPath, nextDisk);
+    logStep(`resized disk for "${vmId}" from ${vm.diskSizeMib} MiB to ${nextDisk} MiB.`);
+  }
+
+  db.vms[vmId] = {
+    ...vm,
+    vcpuCount: nextVcpu,
+    memSizeMib: nextMem,
+    diskSizeMib: nextDisk,
+    sshUser: nextSshUser,
+  };
+  writeVmDatabase(db);
+  logStep(
+    `updated "${vmId}": cpus=${nextVcpu}, memory=${nextMem} MiB, disk=${nextDisk} MiB, ssh-user=${nextSshUser}${running ? " (cpu/memory apply on next start)" : ""}`,
+  );
+};
+
 const runDelete = async (vmId: string): Promise<void> => {
   assertVmId(vmId);
   const db = readVmDatabase();
@@ -476,6 +770,11 @@ const runStatus = async (vmIdArg?: string): Promise<void> => {
     .map((vm) => ({
       id: vm.vmId,
       index: vm.index,
+      cpus: vm.vcpuCount,
+      memoryMib: vm.memSizeMib,
+      diskSizeMib: vm.diskSizeMib,
+      sshUser: vm.sshUser,
+      dockerfilePath: vm.dockerfilePath,
       guestIp: vm.guestIp,
       tapDev: vm.tapDev,
       rootfsPath: vm.rootfsPath,
@@ -560,7 +859,7 @@ const vmDataDir = (vmId: string): string => join(VMS_DIR, vmId);
 
 const formatHexByte = (value: number): string => value.toString(16).padStart(2, "0").toUpperCase();
 
-const buildVmConfig = (vmId: string, index: number): VmConfig => {
+const buildVmConfig = (vmId: string, index: number, options: CreateVmOptions): VmConfig => {
   const subnetBase = index * 4;
   const thirdOctet = Math.floor(subnetBase / 256);
   const fourthBase = subnetBase % 256;
@@ -585,7 +884,11 @@ const buildVmConfig = (vmId: string, index: number): VmConfig => {
     guestMac: `06:00:AC:10:${formatHexByte(thirdOctet)}:${formatHexByte(guestLast)}`,
     apiSocketPath: `/tmp/microvm-${vmId}.firecracker.sock`,
     logPath: join(RUNTIME_DIR, vmId, "firecracker.log"),
-    sshUser: DEFAULT_VM_SSH_USER,
+    sshUser: options.sshUser,
+    vcpuCount: options.vcpuCount,
+    memSizeMib: options.memSizeMib,
+    diskSizeMib: options.diskSizeMib,
+    dockerfilePath: options.dockerfilePath,
   };
 };
 
@@ -631,10 +934,13 @@ const reserveVmIndex = (db: VmDatabase): number => {
       .map((vm) => Number(vm.index))
       .filter((index) => Number.isFinite(index)),
   );
-  let candidate = Math.max(0, db.nextIndex);
+
+  // Reuse the lowest available index so /30 guest IPs are recycled after delete.
+  let candidate = 0;
   while (usedIndexes.has(candidate)) {
     candidate += 1;
   }
+
   db.nextIndex = candidate + 1;
   return candidate;
 };
@@ -653,6 +959,33 @@ const cloneExt4Rootfs = (sourcePath: string, targetPath: string): void => {
     run(["cp", "-f", sourcePath, targetPath]);
   }
   chmodSync(targetPath, 0o644);
+};
+
+const diskSizeMiB = (path: string): number => {
+  const bytes = statSync(path).size;
+  return Math.floor(bytes / (1024 * 1024));
+};
+
+const growExt4DiskIfNeeded = (ext4Path: string, targetSizeMib: number): void => {
+  if (!existsSync(ext4Path)) {
+    throw new Error(`Cannot resize missing ext4 image: ${ext4Path}`);
+  }
+  const currentSizeMib = diskSizeMiB(ext4Path);
+  if (targetSizeMib < currentSizeMib) {
+    throw new Error(
+      `Requested disk size ${targetSizeMib} MiB is smaller than current image size ${currentSizeMib} MiB.`,
+    );
+  }
+  if (targetSizeMib === currentSizeMib) {
+    return;
+  }
+
+  run(["truncate", "-s", `${targetSizeMib}M`, ext4Path]);
+  const fsck = runRoot(["e2fsck", "-f", "-y", ext4Path], { allowFailure: true });
+  if (fsck.exitCode > 1) {
+    throw new Error(`e2fsck failed while resizing ${ext4Path}: ${fsck.stderr || fsck.stdout}`);
+  }
+  runRoot(["resize2fs", ext4Path]);
 };
 
 const getVmOrThrow = (vmId: string): VmRecord => {
@@ -744,16 +1077,14 @@ const ensureSshKeyPair = (privateKeyPath: string): SshKeyPair => {
   return { privateKeyPath, publicKeyPath };
 };
 
-const ensureArchRootfsFromDocker = async ({
+const ensureRootfsFromDocker = async ({
   dockerfilePath,
-  ext4Path,
-  metaPath,
   sshPublicKeyPath,
+  sshUser,
 }: {
   dockerfilePath: string;
-  ext4Path: string;
-  metaPath: string;
   sshPublicKeyPath: string;
+  sshUser: string;
 }): Promise<RootfsArtifact> => {
   if (!existsSync(dockerfilePath)) {
     throw new Error(`Missing Dockerfile for rootfs build: ${dockerfilePath}`);
@@ -761,25 +1092,35 @@ const ensureArchRootfsFromDocker = async ({
 
   const dockerfileSha = sha256OfFile(dockerfilePath);
   const sshPubKeySha = sha256OfFile(sshPublicKeyPath);
-  const buildHash = `${dockerfileSha}:${sshPubKeySha}`;
+  const buildHash = `${dockerfileSha}:${sshPubKeySha}:${sshUser}`;
+  const cacheKey = createHash("sha256")
+    .update(`${ROOTFS_BUILD_FORMAT_VERSION}:${dockerfilePath}:${buildHash}`)
+    .digest("hex")
+    .slice(0, 20);
+  const source = `dockerfile:${dockerfilePath}`;
+  const ext4Path = resolve(ARTIFACTS_DIR, "rootfs", `${cacheKey}.ext4`);
+  const metaPath = resolve(ARTIFACTS_DIR, "rootfs", `${cacheKey}.meta.json`);
+  const contextPath = dirname(dockerfilePath);
 
   if (existsSync(ext4Path) && existsSync(metaPath)) {
     const meta = JSON.parse(readFileSync(metaPath, "utf8")) as RootfsBuildMeta;
     if (
       meta.formatVersion === ROOTFS_BUILD_FORMAT_VERSION &&
+      meta.dockerfilePath === dockerfilePath &&
       meta.dockerfileSha256 === dockerfileSha &&
-      meta.sshPubKeySha256 === sshPubKeySha
+      meta.sshPubKeySha256 === sshPubKeySha &&
+      meta.sshUser === sshUser
     ) {
       logStep(`reuse: ${ext4Path}`);
       return {
-        source: "archlinux (docker)",
+        source,
         ext4Path,
         buildHash,
       };
     }
   }
 
-  const imageTag = "microvm-arch-rootfs:local";
+  const imageTag = `microvm-rootfs:${cacheKey}`;
   const buildId = `${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
   const tempDir = join(ROOTFS_TMP_DIR, `rootfs-build-${buildId}`);
   const tarPath = join(tempDir, "rootfs.tar");
@@ -788,8 +1129,8 @@ const ensureArchRootfsFromDocker = async ({
   ensureDirs([ROOTFS_TMP_DIR, tempDir, dirname(ext4Path)]);
   runRoot(["mkdir", "-p", treePath]);
 
-  logStep(`building docker image: ${imageTag}`);
-  run(["docker", "build", "-f", dockerfilePath, "-t", imageTag, PROJECT_ROOT], { inherit: true });
+  logStep(`building docker image: ${imageTag} from ${dockerfilePath}`);
+  run(["docker", "build", "-f", dockerfilePath, "-t", imageTag, contextPath], { inherit: true });
 
   const containerId = run(["docker", "create", imageTag]).stdout.trim();
   if (!containerId) {
@@ -803,8 +1144,8 @@ const ensureArchRootfsFromDocker = async ({
 
     runRoot(["rm", "-f", join(treePath, ".dockerenv")], { allowFailure: true });
     writeDeterministicResolvConf(treePath);
-    injectAuthorizedKeys(treePath, sshPublicKeyPath);
-    validateRootfsForBoot(treePath);
+    validateRootfsForBoot(treePath, sshUser);
+    injectAuthorizedKeys(treePath, sshPublicKeyPath, sshUser);
 
     const sizeMib = recommendedRootfsSizeMiB(treePath);
     const ext4TempPath = `${ext4Path}.tmp`;
@@ -819,9 +1160,11 @@ const ensureArchRootfsFromDocker = async ({
 
     const meta: RootfsBuildMeta = {
       formatVersion: ROOTFS_BUILD_FORMAT_VERSION,
+      dockerfilePath,
       dockerfileSha256: dockerfileSha,
       sshPubKeySha256: sshPubKeySha,
-      source: "archlinux (docker)",
+      sshUser,
+      source,
       builtAt: new Date().toISOString(),
     };
     writeJson(metaPath, meta);
@@ -831,15 +1174,22 @@ const ensureArchRootfsFromDocker = async ({
   }
 
   return {
-    source: "archlinux (docker)",
+    source,
     ext4Path,
     buildHash,
   };
 };
 
-const injectAuthorizedKeys = (treePath: string, sshPublicKeyPath: string): void => {
-  injectAuthorizedKeyAtHome(join(treePath, "root"), sshPublicKeyPath, "0:0");
-  injectAuthorizedKeyAtHome(join(treePath, "home", "thierry"), sshPublicKeyPath, "1000:1000");
+const injectAuthorizedKeys = (treePath: string, sshPublicKeyPath: string, sshUser: string): void => {
+  const passwdUsers = loadPasswdUsers(treePath);
+  for (const user of new Set(["root", sshUser])) {
+    const record = passwdUsers[user];
+    if (!record) {
+      throw new Error(`Rootfs is missing expected user "${user}" in /etc/passwd`);
+    }
+    const homePath = join(treePath, record.home.replace(/^\/+/, ""));
+    injectAuthorizedKeyAtHome(homePath, sshPublicKeyPath, `${record.uid}:${record.gid}`);
+  }
 };
 
 const injectAuthorizedKeyAtHome = (homePath: string, sshPublicKeyPath: string, ownership: string): void => {
@@ -852,7 +1202,7 @@ const injectAuthorizedKeyAtHome = (homePath: string, sshPublicKeyPath: string, o
   runRoot(["chown", "-R", ownership, sshDir]);
 };
 
-const validateRootfsForBoot = (treePath: string): void => {
+const validateRootfsForBoot = (treePath: string, sshUser: string): void => {
   assertExecutable(join(treePath, "sbin", "init"), "Rootfs is missing /sbin/init");
 
   const sshdCandidates = [join(treePath, "usr", "bin", "sshd"), join(treePath, "usr", "sbin", "sshd")];
@@ -861,8 +1211,24 @@ const validateRootfsForBoot = (treePath: string): void => {
     throw new Error("Rootfs is missing sshd binary (expected /usr/bin/sshd or /usr/sbin/sshd).");
   }
 
-  assertDirectory(join(treePath, "home", "thierry"), "Rootfs is missing /home/thierry");
-  assertPasswdUserExists(treePath, "thierry");
+  assertPasswdUserExists(treePath, "root");
+  assertPasswdUserExists(treePath, sshUser);
+};
+
+const loadPasswdUsers = (treePath: string): Record<string, { uid: string; gid: string; home: string }> => {
+  const passwdPath = join(treePath, "etc", "passwd");
+  const passwd = readFileSync(passwdPath, "utf8");
+  return passwd
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+    .reduce<Record<string, { uid: string; gid: string; home: string }>>((acc, line) => {
+      const [username, _password, uid, gid, _gecos, home] = line.split(":");
+      if (username && uid && gid && home) {
+        acc[username] = { uid, gid, home };
+      }
+      return acc;
+    }, {});
 };
 
 const writeDeterministicResolvConf = (treePath: string): void => {
@@ -882,13 +1248,6 @@ const recommendedRootfsSizeMiB = (treePath: string): number => {
 
 const assertExecutable = (path: string, message: string): void => {
   if (runRoot(["test", "-x", path], { allowFailure: true }).exitCode === 0) {
-    return;
-  }
-  throw new Error(`${message}: ${path}`);
-};
-
-const assertDirectory = (path: string, message: string): void => {
-  if (runRoot(["test", "-d", path], { allowFailure: true }).exitCode === 0) {
     return;
   }
   throw new Error(`${message}: ${path}`);
@@ -1145,7 +1504,7 @@ const cleanupJailerVmDir = (vmDir: string | undefined): void => {
   runRoot(["rm", "-rf", resolved], { allowFailure: true });
 };
 
-const resolveJailerProfile = (): JailerProfile => {
+const resolveJailerProfile = (requiredFsizeBytes: number): JailerProfile => {
   ensureCgroupV2Available();
 
   const parentCgroup = envOrDefault("MICROVM_CGROUP_PARENT", DEFAULT_JAILER_PARENT_CGROUP);
@@ -1154,7 +1513,16 @@ const resolveJailerProfile = (): JailerProfile => {
   const cpuMax = envOrDefault("MICROVM_CGROUP_CPU_MAX", DEFAULT_CGROUP_CPU_MAX);
   const pidsMax = envOrDefault("MICROVM_CGROUP_PIDS_MAX", DEFAULT_CGROUP_PIDS_MAX);
   const rlimitNoFile = envOrDefault("MICROVM_RLIMIT_NOFILE", DEFAULT_RLIMIT_NOFILE);
-  const rlimitFsize = envOrDefault("MICROVM_RLIMIT_FSIZE", DEFAULT_RLIMIT_FSIZE);
+  const configuredFsize = parsePositiveInt(
+    envOrDefault("MICROVM_RLIMIT_FSIZE", DEFAULT_RLIMIT_FSIZE),
+    "MICROVM_RLIMIT_FSIZE",
+  );
+  const rlimitFsize = Math.max(configuredFsize, requiredFsizeBytes);
+  if (rlimitFsize > configuredFsize) {
+    logStep(
+      `raising jailer fsize limit from ${configuredFsize} to ${rlimitFsize} bytes to support disk size`,
+    );
+  }
 
   return {
     cgroupVersion: "2",
@@ -1167,7 +1535,7 @@ const resolveJailerProfile = (): JailerProfile => {
     ],
     resourceLimits: [
       `no-file=${rlimitNoFile}`,
-      `fsize=${rlimitFsize}`,
+      `fsize=${String(rlimitFsize)}`,
     ],
   };
 };
@@ -1435,8 +1803,8 @@ const configureAndStartVm = async ({
   bootArgs: string;
 }): Promise<void> => {
   firecrackerPut(config.apiSocketPath, "/machine-config", {
-    vcpu_count: 2,
-    mem_size_mib: 1024,
+    vcpu_count: config.vcpuCount,
+    mem_size_mib: config.memSizeMib,
   });
   firecrackerPut(config.apiSocketPath, "/boot-source", {
     kernel_image_path: kernelPath,
