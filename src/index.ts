@@ -834,11 +834,11 @@ const assertVmId = (vmId: string): void => {
 };
 
 const assertJailerSafeVmId = (vmId: string): void => {
-  if (/^[a-z0-9][a-z0-9_]{0,31}$/.test(vmId)) {
+  if (/^[a-z0-9][a-z0-9-]{0,31}$/.test(vmId)) {
     return;
   }
   throw new Error(
-    `VM "${vmId}" is not jailer-safe. For create/start, use lowercase letters, digits, and '_' only.`,
+    `VM "${vmId}" is not jailer-safe. For create/start, use lowercase letters, digits, and '-' only.`,
   );
 };
 

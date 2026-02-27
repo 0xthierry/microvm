@@ -10,6 +10,15 @@
 - Prefer small functions and composition.
 - Use `docs/firecracker.md` and `.repositories/firecracker/docs/*` as primary references.
 
+## VM ID Constraints (Important)
+- For VM lifecycle commands that go through jailer (`create`, `start`, `up`), VM IDs must be **jailer-safe**:
+  - allowed chars: lowercase letters, digits, `-`
+  - disallowed: `_`
+- VM ID length is also constrained by Unix socket path length (`<= 107` bytes).
+  - The max VM ID length is computed from the current repo path.
+  - In this repo path, errors show a practical max of around `15` characters.
+  - If path length changes, this max changes too.
+
 ## Current Capabilities
 - `bun src/index.ts up`:
   - resolves latest Firecracker release and latest CI kernel key for host arch.
