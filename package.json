@@ -10,6 +10,7 @@
     "prepare": "lefthook install",
     "start": "bash ./scripts/start.sh",
     "build:binary": "mkdir -p dist && bun build ./src/index.ts --compile --outfile dist/microvm",
+    "kernel:build": "bash ./kernel/scripts/build.sh",
     "install:cli": "bash ./scripts/install-cli.sh",
     "uninstall:cli": "bash ./scripts/uninstall-cli.sh",
     "typecheck": "tsgo --noEmit --project tsconfig.json",
