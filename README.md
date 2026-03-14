@@ -300,7 +300,7 @@ If `~/.local/bin` is not on your `PATH`, the script prints the export line to ad
 ## What happens under the hood
 
 - `create` builds a rootfs from your Dockerfile using Docker, exports it, injects managed SSH keys, and stores the VM metadata on disk.
-- `up` prepares host networking, stages assets into a Firecracker jail, fetches and caches a Firecracker-compatible kernel if needed, configures Firecracker, boots the guest, and waits for SSH.
+- `up` prepares host networking, stages assets into a Firecracker jail, requires a repo-local kernel build under `kernel/dist/<arch>/`, configures Firecracker, boots the guest, and waits for SSH.
 - `down` stops the VM process, tears down networking, and clears runtime metadata.
 - `delete` removes the VM record, runtime artifacts, and disk files. Running VMs are stopped first.
 
@@ -318,7 +318,7 @@ For project-local state during development or testing:
 export MICROVM_HOME=.microvm
 ```
 
-The CLI also manages a shared SSH keypair under the configured state directories and reuses cached rootfs and kernel artifacts when possible.
+The CLI also manages a shared SSH keypair under the configured state directories and reuses cached rootfs artifacts when possible.
 
 Per-VM lifecycle events are also written as NDJSON logs under the runtime `events/` directory.
 
@@ -337,6 +337,7 @@ This project is intentionally narrow right now:
 - [CLI guide](docs/cli.md)
 - [Install details](docs/install.md)
 - [Firecracker notes](docs/firecracker.md)
+- [Kernel workspace](kernel/README.md)
 
 ## Development
 
