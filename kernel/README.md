@@ -4,7 +4,7 @@ This directory contains the repo-local guest kernel workflow for `microvm`.
 
 The goal is to stay very close to Firecracker's published Amazon Linux
 microVM kernel recipe and make only the smallest change needed for Docker in
-the guest: enable the raw iptables tables that Docker bridge networking expects.
+the guest.
 
 ## Source Versions
 
@@ -69,10 +69,36 @@ The build script reads that file directly so the local build is reproducible.
   recipe. This enables:
   - `CONFIG_IP_NF_RAW=y`
   - `CONFIG_IP6_NF_RAW=y`
+  - `CONFIG_NF_TABLES=y`
+  - `CONFIG_NF_TABLES_IPV4=y`
+  - `CONFIG_NF_TABLES_IPV6=y`
+  - `CONFIG_NF_TABLES_INET=y`
+  - `CONFIG_NFT_COMPAT=y`
+  - `CONFIG_NFT_CT=y`
+  - `CONFIG_NFT_NAT=y`
+  - `CONFIG_NFT_MASQ=y`
+  - `CONFIG_NFT_REDIR=y`
+  - `CONFIG_NF_CT_NETLINK=y`
 
-Firecracker's checked-in guest configs explicitly disable both of those. Docker
-bridge networking inside the guest expects the raw iptables tables to exist, so
-this overlay restores them.
+Firecracker's checked-in guest configs explicitly disable the raw tables and
+also keep `NF_TABLES` off. That was enough for Firecracker's own CI kernels,
+but it was not enough for our Ubuntu 24.04 guest userspace. The new
+`e2e/cli/docker-in-guest.sh` test showed Docker failing at daemon startup with:
+
+```text
+iptables: Failed to initialize nft: Protocol not supported
+```
+
+That failure came from the guest's default `iptables-nft` backend, not from the
+legacy iptables path alone. The overlay therefore restores:
+
+- the legacy raw tables that Docker bridge networking expects
+- the nftables family that Ubuntu's `iptables` wrapper talks to by default
+- conntrack netlink support, which Docker warned about during daemon startup
+
+This is still intentionally narrow: we are not replacing Firecracker's netfilter
+profile wholesale, only adding the pieces that the Docker-in-guest e2e exposed
+as missing.
 
 ## Build Output
 
