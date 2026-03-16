@@ -11,6 +11,7 @@ fi
 
 TESTS=(
   "$SCRIPT_DIR/cli/lifecycle.sh"
+  "$SCRIPT_DIR/cli/docker-in-guest.sh"
   "$SCRIPT_DIR/cli/options.sh"
   "$SCRIPT_DIR/network/reachability.sh"
   "$SCRIPT_DIR/network/host-network-cleanup.sh"
