@@ -5,8 +5,8 @@ import { createTestAppConfig } from "../../test/test-app-config";
 import { KernelService } from "./kernel.service";
 
 describe("KernelService", () => {
-  it("uses the repo-local kernel build", async () => {
-    const { cleanup, rootDir } = createTestAppConfig();
+  it("uses the installed kernel artifact", async () => {
+    const { cleanup, config } = createTestAppConfig();
 
     const hostArch =
       process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : undefined;
@@ -17,7 +17,7 @@ describe("KernelService", () => {
     }
 
     try {
-      const kernelDir = join(rootDir, "kernel", "dist", hostArch);
+      const kernelDir = join(config.paths.kernelDir, hostArch);
       const kernelPath = join(kernelDir, "vmlinux");
       const metaPath = join(kernelDir, "vmlinux.meta.json");
 
@@ -48,7 +48,7 @@ describe("KernelService", () => {
     }
   });
 
-  it("fails when the repo-local kernel build is missing", async () => {
+  it("fails when the kernel artifact is missing", async () => {
     const { cleanup } = createTestAppConfig();
     const hostArch =
       process.arch === "x64" ? "x86_64" : process.arch === "arm64" ? "aarch64" : undefined;
@@ -61,7 +61,7 @@ describe("KernelService", () => {
     try {
       const service = new KernelService();
       await expect(service.ensureKernelArtifact()).rejects.toThrow(
-        "Required repo-local kernel artifact is missing.",
+        "Required kernel artifact is missing.",
       );
     } finally {
       cleanup();

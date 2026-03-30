@@ -29,12 +29,12 @@ const mapHostArchToFirecrackerArch = (hostArch: string): string => {
 export class KernelService {
   async ensureKernelArtifact(): Promise<KernelArtifact> {
     const config = getAppConfig();
-    return this.readProjectKernelArtifact(config.paths.projectRoot);
+    const arch = mapHostArchToFirecrackerArch(process.arch);
+    const kernelDir = join(config.paths.kernelDir, arch);
+    return this.readKernelArtifact(kernelDir);
   }
 
-  private readProjectKernelArtifact(projectRoot: string): KernelArtifact {
-    const arch = mapHostArchToFirecrackerArch(process.arch);
-    const kernelDir = join(projectRoot, "kernel", "dist", arch);
+  private readKernelArtifact(kernelDir: string): KernelArtifact {
     const kernelPath = join(kernelDir, "vmlinux");
     const metaPath = join(kernelDir, "vmlinux.meta.json");
 

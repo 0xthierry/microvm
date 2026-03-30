@@ -15,6 +15,7 @@ export type RuntimePaths = {
   rootfsTmpDir: string;
   jailerBaseDir: string;
   sharedSshPrivateKeyPath: string;
+  kernelDir: string;
 };
 
 const isMicrovmProjectRoot = (projectRoot: string): boolean => {
@@ -63,13 +64,14 @@ export const buildRuntimePaths = ({
   const xdgRuntimeHome = absoluteOrUndefined(env.XDG_RUNTIME_DIR);
 
   // Dev-local mode: explicit override or running from source repo with no XDG/HOME hints.
-  if (microvmHome || (
-    isMicrovmProjectRoot(projectRoot)
-    && !xdgDataHome
-    && !xdgStateHome
-    && !xdgCacheHome
-    && !homeDir
-  )) {
+  if (
+    microvmHome ||
+    (isMicrovmProjectRoot(projectRoot) &&
+      !xdgDataHome &&
+      !xdgStateHome &&
+      !xdgCacheHome &&
+      !homeDir)
+  ) {
     const workDir = microvmHome ?? resolve(projectRoot, ".microvm");
     const artifactsDir = join(workDir, "artifacts");
     return {
@@ -85,15 +87,18 @@ export const buildRuntimePaths = ({
       rootfsTmpDir: resolve(workDir, "tmp"),
       jailerBaseDir: resolve(workDir, "jailer"),
       sharedSshPrivateKeyPath: resolve(artifactsDir, "keys", "microvm.id_ed25519"),
+      kernelDir: resolve(projectRoot, "kernel", "dist"),
     };
   }
 
   const dataDir = join(
-    xdgDataHome ?? (homeDir ? join(homeDir, ".local", "share") : resolve(projectRoot, ".microvm", "data")),
+    xdgDataHome ??
+      (homeDir ? join(homeDir, ".local", "share") : resolve(projectRoot, ".microvm", "data")),
     "microvm",
   );
   const stateDir = join(
-    xdgStateHome ?? (homeDir ? join(homeDir, ".local", "state") : resolve(projectRoot, ".microvm", "state")),
+    xdgStateHome ??
+      (homeDir ? join(homeDir, ".local", "state") : resolve(projectRoot, ".microvm", "state")),
     "microvm",
   );
   const cacheDir = join(
@@ -116,5 +121,6 @@ export const buildRuntimePaths = ({
     rootfsTmpDir: resolve(cacheDir, "tmp"),
     jailerBaseDir: resolve(stateDir, "jailer"),
     sharedSshPrivateKeyPath: resolve(dataDir, "keys", "microvm.id_ed25519"),
+    kernelDir: resolve(artifactsDir, "kernel"),
   };
 };
