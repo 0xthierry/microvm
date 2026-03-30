@@ -29,6 +29,14 @@ echo "[microvm] Installing binary into ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"
 install -m 0755 "${BIN_SOURCE}" "${BIN_TARGET}"
 
+KERNEL_SRC="${PROJECT_ROOT}/kernel/dist"
+KERNEL_DEST="${XDG_CACHE_HOME:-${HOME}/.cache}/microvm/artifacts/kernel"
+if [ -d "${KERNEL_SRC}" ]; then
+  echo "[microvm] Installing kernel artifacts into ${KERNEL_DEST}..."
+  mkdir -p "${KERNEL_DEST}"
+  cp -r "${KERNEL_SRC}/." "${KERNEL_DEST}/"
+fi
+
 echo "[microvm] Installed: ${BIN_TARGET}"
 if [[ ":${PATH}:" == *":${INSTALL_DIR}:"* ]]; then
   if command -v microvm >/dev/null 2>&1; then

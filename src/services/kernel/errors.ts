@@ -13,11 +13,11 @@ export class KernelUnsupportedHostArchError extends AppError {
 
 export class KernelArtifactMissingError extends AppError {
   constructor(params: { path: string }) {
-    super("Required repo-local kernel artifact is missing.", {
+    super("Required kernel artifact is missing.", {
       details: {
         path: params.path,
       },
-      hint: "Build the repo-local kernel first with `bun run kernel:build`.",
+      hint: "Run `microvm` from the project repo, or re-run the install script to copy kernel artifacts.",
     });
   }
 }
